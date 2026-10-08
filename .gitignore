@@ -1,0 +1,23 @@
+# --- Secretos y credenciales: NUNCA subir ---
+**/conexion.php
+**/credentials.php
+**/config/
+**/*secret*
+**/*credential*
+.env
+.env.*
+*.key
+*.pem
+
+# --- Archivos de clientes / generados ---
+**/uploads/
+dist/
+*.zip
+
+# --- Dependencias / basura ---
+**/vendor/
+**/node_modules/
+**/_backup_*/
+tmp/
+.DS_Store
+Thumbs.db

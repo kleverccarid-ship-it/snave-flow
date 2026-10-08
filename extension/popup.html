@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+<!-- Vista del panel: la extensión como estación que genera lo que llega de SnaveCloud -->
+<div id="vistaPanel">
+  <header class="marca">
+    <div class="logo">S</div>
+    <div>
+      <h1>SnaveCloud</h1>
+      <small><span class="punto" id="puntoMarca"></span> FLOW · V <span id="version"></span></small>
+    </div>
+  </header>
+
+  <section id="conectar" class="tarjeta" hidden>
+    <p class="titulo">Token de esta extensión</p>
+    <p class="ayuda">1) Copia este token. 2) Pégalo en tu panel SnaveCloud (página "Cola de Flow"). 3) Pulsa "Comprobar".</p>
+    <div style="display:flex;gap:6px;align-items:center;">
+      <input id="miToken" type="text" readonly style="flex:1;font-family:monospace;font-size:11px;">
+      <button id="copiarToken" style="width:auto;padding:8px 12px;">Copiar</button>
+    </div>
+    <button id="probar">Comprobar conexión</button>
+    <p id="activarMsg" class="ayuda"></p>
+
+    <details id="manualConectar">
+      <summary class="ayuda">Conectar a mano (avanzado)</summary>
+      <label>URL del panel
+        <input id="panel_url" type="text" autocomplete="off" placeholder="https://app.snavecloud.pro/dashboard/">
+      </label>
+      <label>Token
+        <input id="panel_token" type="password" autocomplete="off">
+      </label>
+      <button id="panelConectar">Conectar</button>
+      <p class="ayuda">La URL sale en tu panel; el token es el de arriba.</p>
+    </details>
+  </section>
+
+  <section id="conectado" hidden>
+    <div class="tarjeta estado">
+      <span class="punto" id="punto"></span>
+      <div>
+        <p class="titulo">Estado</p>
+        <b id="estadoTexto">Conectando…</b>
+      </div>
+    </div>
+
+    <div class="tarjeta">
+      <div class="fila-cola">
+        <div class="icono">🎬</div>
+        <div>
+          <p class="titulo">Prompts en la cola</p>
+          <b id="nPendientes" class="grande">–</b>
+        </div>
+        <span id="eta" class="eta" hidden></span>
+      </div>
+      <div class="contadores">
+        <div><p class="titulo">Hechos hoy</p><b id="nHechos" class="verde">–</b></div>
+        <div><p class="titulo">En curso</p><b id="nCurso" class="azul">–</b></div>
+        <div><p class="titulo">Errores hoy</p><b id="nErrores" class="rojo">–</b></div>
+      </div>
+      <div class="barra"><div id="barra"></div></div>
+      <p id="actividad" class="actividad"></p>
+      <label class="interruptor">
+        <span>Procesar automáticamente</span>
+        <input id="auto" type="checkbox"><i></i>
+      </label>
+    </div>
+
+    <div class="tarjeta" id="refsCard" hidden>
+      <p class="titulo">Imágenes de referencia del último pedido <span id="refsPedido"></span></p>
+      <p class="ayuda">Guardadas en tu PC: <b>Descargas / snave-referencias</b>.</p>
+      <div id="refsLista" class="refs-lista"></div>
+      <button id="abrirDescargas" class="secondary">Abrir carpeta de Descargas</button>
+    </div>
+
+    <button id="abrirPanel" class="principal">Abrir SnaveCloud →</button>
+    <button id="desconectar" class="secondary">Desconectar</button>
+  </section>
+
+  <p id="statusPanel" role="status"></p>
+  <pre id="diagVistaPanel" class="diag" hidden></pre>
+  <button id="diagPanel" class="link">Copiar diagnóstico (si algo falla con Flow)</button>
+  <button id="aManual" class="link">Modo manual (rellenar a mano, guion con IA…)</button>
+</div>
+
+<div id="vistaManual" hidden>
+  <button id="aPanel" class="link volver">← Volver al panel</button>
+  <h1>SnaveCloud</h1>
+
+  <label>Prompt (uno por línea para hacer una tanda)
+    <textarea id="prompt" rows="5" placeholder="Un perro corriendo por un parque al atardecer&#10;Un gato durmiendo al sol&#10;Un caballo galopando en la playa"></textarea>
+  </label>
+  <p id="tanda" class="tanda"></p>
+
+  <details>
+    <summary>Personaje y estilo fijos</summary>
+    <label>Personaje (va delante de cada prompt)
+      <textarea id="personaje" rows="2" placeholder="Una niña de 8 años, pelo rizado castaño, chaqueta amarilla"></textarea>
+    </label>
+    <label>Estilo (va detrás de cada prompt)
+      <textarea id="estilo" rows="2" placeholder="Estilo Pixar, luz cálida, colores saturados"></textarea>
+    </label>
+  </details>
+
+  <details>
+    <summary>Guion → escenas con IA</summary>
+    <label>Guion
+      <textarea id="guion" rows="4" placeholder="Pega aquí el guion o la historia"></textarea>
+    </label>
+    <div class="row">
+      <label>IA
+        <select id="proveedor">
+          <option value="claude">Claude</option>
+          <option value="openai">OpenAI</option>
+          <option value="gemini">Gemini</option>
+        </select>
+      </label>
+      <label>Escenas
+        <select id="escenas"><option>4</option><option>6</option><option selected>8</option><option>10</option><option>12</option><option>16</option><option>20</option></select>
+      </label>
+    </div>
+    <label>Modelo (vacío = el de por defecto)
+      <input id="ia_modelo" type="text" autocomplete="off">
+    </label>
+    <label>API key (se guarda solo en este Chrome)
+      <input id="ia_clave" type="password" autocomplete="off">
+    </label>
+    <button id="generar" class="secondary">Generar escenas</button>
+  </details>
+
+  <div class="row">
+    <label>Tipo
+      <select id="mode"><option value="video">Video</option><option value="imagen">Imagen</option></select>
+    </label>
+    <label>Modelo
+      <select id="model">
+        <option value="">No cambiar</option>
+        <optgroup label="Video">
+          <option value="Lower Priority" selected>Veo 3.1 - Lite [Lower Priority]</option>
+          <option value="Veo 3.1 - Lite">Veo 3.1 - Lite</option>
+          <option value="Veo 3.1 - Fast">Veo 3.1 - Fast</option>
+          <option value="Veo 3.1 - Quality">Veo 3.1 - Quality</option>
+          <option value="Omni 1.1 Flash">Omni 1.1 Flash</option>
+        </optgroup>
+        <optgroup label="Imagen">
+          <option value="Nano Banana Pro">Nano Banana Pro</option>
+          <option value="Nano Banana">Nano Banana</option>
+          <option value="Imagen 4">Imagen 4</option>
+        </optgroup>
+      </select>
+    </label>
+  </div>
+
+  <div class="row">
+    <label>Formato
+      <select id="aspect"><option value="">No cambiar</option><option>16:9</option><option>9:16</option></select>
+    </label>
+    <label>Resolución
+      <select id="res"><option value="" selected>No cambiar</option><option>360p</option><option>720p</option></select>
+    </label>
+  </div>
+
+  <div class="row">
+    <label id="durLabel">Segundos
+      <select id="dur"><option>4</option><option>6</option><option selected>8</option><option>10</option></select>
+    </label>
+    <label>Cantidad
+      <select id="count"><option selected>1</option><option>2</option><option>3</option><option>4</option></select>
+    </label>
+  </div>
+
+  <button id="fill">Rellenar en Flow</button>
+  <button id="cola" class="auto">Cola automática</button>
+  <p id="colaEstado" class="tanda"></p>
+  <button id="reset" class="link" hidden>Empezar la tanda de nuevo</button>
+  <p id="status" role="status"></p>
+  <pre id="diagVistaManual" class="diag" hidden></pre>
+  <div class="row">
+    <button id="download" class="secondary">Descargar</button>
+    <button id="links" class="secondary">Copiar enlaces</button>
+  </div>
+  <button id="diagnostico" class="link">Copiar diagnóstico (si algo falla con Flow)</button>
+  <p class="note">Cada Rellenar o <b id="shortcut">Alt+Shift+F</b> pone el siguiente prompt de la lista y pulsa la flecha de crear.<br>
+    La cola automática envía todos, espera cada resultado y lo descarga. Deja la pestaña de Flow abierta.<br>
+    Descargar baja solo lo del último prompt enviado; con la caja vacía, todo.</p>
+
+</div>
+
+  <script src="util.js"></script>
+  <script src="panel.js"></script>
+  <script src="fill.js"></script>
+  <script src="tanda.js"></script>
+  <script src="ia.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

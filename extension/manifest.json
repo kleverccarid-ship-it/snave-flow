@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "SnaveCloud",
+  "version": "2.52.0",
+  "description": "Rellena Google Flow, envia una cola de prompts sola, descarga los resultados y convierte un guion en escenas con IA.",
+  "permissions": ["activeTab", "scripting", "storage", "downloads", "debugger", "alarms", "webRequest"],
+  "host_permissions": [
+    "https://flow.google.com/*",
+    "https://labs.google/*",
+    "https://api.anthropic.com/*",
+    "https://api.openai.com/*",
+    "https://generativelanguage.googleapis.com/*",
+    "https://flow-content.google/*",
+    "https://*.googlevideo.com/*",
+    "https://*.googleusercontent.com/*",
+    "https://storage.googleapis.com/*",
+    "https://*.googleapis.com/*",
+    "https://snavecloud.site/*",
+    "https://*.snavecloud.site/*",
+    "https://snavecloud.pro/*",
+    "https://*.snavecloud.pro/*",
+    "http://snavecloud.test/*",
+    "http://www.snavecloud.test/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "SnaveCloud"
+  },
+  "commands": {
+    "rellenar": {
+      "suggested_key": { "default": "Alt+Shift+F" },
+      "description": "Rellenar Flow con los ultimos ajustes"
+    }
+  }
+}
