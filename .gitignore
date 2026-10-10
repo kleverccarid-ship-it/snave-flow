@@ -1,7 +1,6 @@
-# --- Secretos y credenciales: NUNCA subir ---
-**/conexion.php
-**/credentials.php
-**/config/
+# --- Secretos: NUNCA subir ---
+dashboard/config/conexion.php
+dashboard/config/crypto_key.php
 **/*secret*
 **/*credential*
 .env
@@ -11,8 +10,9 @@
 
 # --- Archivos de clientes / generados ---
 **/uploads/
-dist/
+**/privado/
 *.zip
+dist/
 
 # --- Dependencias / basura ---
 **/vendor/

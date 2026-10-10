@@ -58,6 +58,8 @@ try {
         flowResponder(401, ['ok' => false, 'error' => 'Token incorrecto. Genera uno nuevo en la página "Crear con Flow" del panel y pégalo en la extensión.']);
     }
     $uid = $usuario['id'];
+    $colaAdmin = FlowCola::esOperadorAdmin($conn, $uid, $usuario['rol']);
+    if (!$colaAdmin) flowResponder(403, ['ok' => false, 'error' => 'Los pedidos de clientes se procesan con la extensión del administrador; no necesitas un token propio.']);
     // Desde que el admin puso la clave de Google (05/10/2026), genera el propio
     // servidor (class/flow_api.php): la extensión ya no toma pedidos, así nunca
     // hay dos generando el mismo
@@ -73,25 +75,37 @@ try {
         flowResponder(403, ['ok' => false, 'error' => 'El administrador desactivó Flow para clientes.']);
     }
 
+    FlowCola::vencerAtrasados($conn);
     $accion = $_GET['accion'] ?? '';
     $esPost = ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST';
     $id     = (int) ($_POST['id'] ?? 0);
 
+    $perfilHash=hash('sha256',strtolower(trim($_SERVER['HTTP_X_FLOW_TOKEN']??'')));
+    if ($accion === 'reposo') flowResponder(200,['ok'=>true,'reposo'=>FlowCola::reposoPerfil($conn,$perfilHash)]);
+    if ($accion === 'reanudar_reposo' && $esPost) {
+        $ok=FlowCola::reanudarReposo($conn,$perfilHash,(string)($_POST['guardia']??''));
+        flowResponder($ok?200:409,['ok'=>$ok,'error'=>$ok?'':'El reposo no terminó o fue cancelado manualmente.']);
+    }
     if ($accion === 'ping') {
-        flowResponder(200, ['ok' => true, 'config' => FlowCola::configPara($conn, $uid)] + FlowCola::resumen($conn, $uid));
+        flowResponder(200, ['ok' => true, 'cola_revision' => 422, 'config' => FlowCola::configPara($conn, $uid, hash('sha256', strtolower(trim($_SERVER['HTTP_X_FLOW_TOKEN'] ?? ''))))] + FlowCola::resumen($conn, $colaAdmin ? null : $uid));
     }
 
     if ($accion === 'siguiente') {
         FlowCola::vencerAtrasados($conn);
-        $t = FlowCola::tomarSiguiente($conn, $uid);
-        flowResponder(200, ['ok' => true, 'trabajo' => $t ? FlowCola::paraExtension($t) : null]);
+        $t = FlowCola::tomarSiguiente($conn, $uid, $colaAdmin, hash('sha256', strtolower(trim($_SERVER['HTTP_X_FLOW_TOKEN'] ?? ''))));
+        $resumen = FlowCola::resumen($conn, $colaAdmin ? null : $uid);
+        $diagnostico = !$t ? FlowCola::diagnosticoAsignacion($conn, hash('sha256', strtolower(trim($_SERVER['HTTP_X_FLOW_TOKEN'] ?? '')))) : null;
+        $espera = !$t && $resumen['pendientes'] > 0 ? $diagnostico['mensaje'] : '';
+        flowResponder(200, ['ok' => true, 'trabajo' => $t ? FlowCola::paraExtension($t) : null, 'pendientes' => $resumen['pendientes'], 'espera' => $espera, 'diagnostico' => $diagnostico, 'cola_revision' => 422]);
     }
 
     // ¿Sigue siendo mío y en proceso el pedido que estoy esperando? (si alguien
     // lo reintentó o lo borró, la extensión lo suelta en vez de esperar en vano)
     if ($accion === 'estado') {
         $t = FlowCola::buscar($conn, (int) ($_GET['id'] ?? 0));
-        $estado = $t && (int) $t['creado_por'] === $uid ? $t['estado'] : 'no_existe';
+        $asignado=$t && FlowCola::esPerfilExtension($conn,(int)$t['id'],$perfilHash);
+        $estado = $t && ($colaAdmin || (int) $t['creado_por'] === $uid) ? $t['estado'] : 'no_existe';
+        if($t && $t['estado']==='procesando' && !$asignado)$estado='reasignado';
         flowResponder(200, ['ok' => true, 'estado' => $estado]);
     }
 
@@ -100,8 +114,37 @@ try {
     }
 
     // Subir, enlazar o cerrar solo pedidos propios
-    if ((in_array($accion, ['archivo', 'enlace', 'terminar'], true) || ($accion === 'proyecto' && $id)) && !FlowCola::esDe($conn, $id, $uid)) {
+    if ((in_array($accion, ['archivo', 'enlace', 'terminar', 'generando', 'conservar'], true) || ($accion === 'proyecto' && $id)) && !$colaAdmin && !FlowCola::esDe($conn, $id, $uid)) {
         flowResponder(404, ['ok' => false, 'error' => 'Ese pedido no existe o no es tuyo.']);
+    }
+
+    if ($accion === 'preparar_limpieza') {
+        $error=FlowCola::prepararLimpiezaSesion($conn,hash('sha256',strtolower(trim($_SERVER['HTTP_X_FLOW_TOKEN']??''))));
+        flowResponder($error?409:200,$error?['ok'=>false,'error'=>$error]:['ok'=>true]);
+    }
+    if ($accion === 'paso') {
+        $ok = FlowCola::registrarPasoExtension($conn,$id,hash('sha256',strtolower(trim($_SERVER['HTTP_X_FLOW_TOKEN']??''))),$_POST['etapa']??'',$_POST['detalle']??'');
+        flowResponder($ok?200:409,['ok'=>$ok,'error'=>$ok?'':'El pedido no está asignado a este perfil.']);
+    }
+    if ($accion === 'politica') {
+        $ok=FlowCola::registrarPolitica($conn,$id,$perfilHash,$_POST['mensaje']??'');
+        flowResponder($ok?200:409,['ok'=>$ok]);
+    }
+    if ($accion === 'progreso') {
+        $valores=json_decode((string)($_POST['porcentajes']??''),true);
+        $ok=FlowCola::registrarPorcentaje($conn,$id,$perfilHash,$valores);
+        flowResponder($ok?200:409,['ok'=>$ok]);
+    }
+    if ($accion === 'generando') {
+        $ok = FlowCola::esPerfilExtension($conn,$id,$perfilHash) && FlowCola::confirmarGeneracion($conn, $id);
+        flowResponder($ok ? 200 : 409, $ok ? ['ok' => true] : ['ok' => false, 'error' => 'Ese pedido ya no está en proceso.']);
+    }
+
+    if ($accion === 'conservar') {
+        $t = FlowCola::buscar($conn, $id);
+        if ($t && in_array($t['estado'], ['cancelado', 'error', 'rechazado'], true)) flowResponder(410, ['ok' => false, 'error' => 'Entrega detenida.']);
+        $error = FlowCola::conservarEntrega($conn, $id, $_POST['url'] ?? '', $_FILES['archivo'] ?? null);
+        flowResponder($error ? 400 : 200, $error ? ['ok' => false, 'error' => $error] : ['ok' => true]);
     }
 
     if ($accion === 'archivo') {
@@ -116,7 +159,13 @@ try {
 
     // La extensión cuenta en qué proyecto de Flow trabajó (o cuál creó)
     if ($accion === 'proyecto') {
-        $ok = FlowCola::registrarProyecto($conn, $uid, $_POST['flow_id'] ?? '', $_POST['nombre'] ?? '', $id, $_POST['alias'] ?? '');
+        $t = $id ? FlowCola::buscar($conn, $id) : null;
+        $uidProyecto = $t ? (int) $t['creado_por'] : $uid;
+        $proyectoPorCuenta = $t && !empty(FlowCola::config($conn)['ext_rotar']) && trim((string) $t['cuenta']) !== '' && trim((string) $t['proyecto']) !== '';
+        $ok = $proyectoPorCuenta
+            ? FlowCola::registrarProyectoExtension($conn, $t, $_POST['flow_id'] ?? '')
+            : FlowCola::registrarProyecto($conn, $uidProyecto, $_POST['flow_id'] ?? '', $_POST['nombre'] ?? '', $id, $_POST['alias'] ?? '');
+        if($ok && $id) FlowCola::registrarProyectoPedido($conn,$id,$perfilHash,$_POST['flow_id']??'');
         flowResponder($ok ? 200 : 400, $ok ? ['ok' => true] : ['ok' => false, 'error' => 'Proyecto no válido.']);
     }
 
@@ -124,16 +173,20 @@ try {
         FlowCola::guardarLatido($conn, $uid, $_POST, $_SERVER['HTTP_X_FLOW_TOKEN'] ?? '');
         // El proyecto que la extensión tiene abierto queda en la lista de proyectos
         if (!empty($_POST['flow_id'])) FlowCola::registrarProyecto($conn, $uid, $_POST['flow_id'], $_POST['nombre'] ?? '');
-        flowResponder(200, ['ok' => true, 'config' => FlowCola::configPara($conn, $uid)]);
+        flowResponder(200, ['ok' => true, 'config' => FlowCola::configPara($conn, $uid, hash('sha256', strtolower(trim($_SERVER['HTTP_X_FLOW_TOKEN'] ?? ''))))]);
     }
 
     if ($accion === 'terminar') {
+        if (($_POST['ok']??'') !== '1' && preg_match('/actividad inusual|unusual activity/iu',(string)($_POST['mensaje']??''))) {
+            FlowCola::iniciarReposo($conn,$perfilHash);
+        }
         // El pedido queda apuntando al proyecto donde se generó (si iba en "Automático")
         $t = FlowCola::buscar($conn, $id);
         if (!empty($_POST['flow_id']) && $t && in_array($t['proyecto'], ['', 'nuevo'], true)) {
-            FlowCola::registrarProyecto($conn, $uid, $_POST['flow_id'], $_POST['nombre'] ?? '', $id);
+            FlowCola::registrarProyecto($conn, (int) $t['creado_por'], $_POST['flow_id'], $_POST['nombre'] ?? '', $id);
         }
         $hecho = FlowCola::terminar($conn, $id, ($_POST['ok'] ?? '') === '1', $_POST['mensaje'] ?? '', ($_POST['transitorio'] ?? '') === '1', ($_POST['rechazo'] ?? '') === '1');
+        if ($hecho) FlowCola::registrarPasoExtension($conn,$id,hash('sha256',strtolower(trim($_SERVER['HTTP_X_FLOW_TOKEN']??''))),($_POST['ok']??'')==='1'?'listo':'error',$_POST['mensaje']??'');
         flowResponder($hecho ? 200 : 409, $hecho ? ['ok' => true] : ['ok' => false, 'error' => 'Ese trabajo no está en proceso.']);
     }
 

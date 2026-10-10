@@ -45,6 +45,7 @@ class FlowApi
         'imagen' => [
             'nano-banana-2-lite' => '🍌 Nano Banana 2 Lite',
             'nano-banana-2'      => '🍌 Nano Banana 2',
+            'nano-banana-2.1'    => '🍌 Nano Banana 2.1',
             'nano-banana-pro'    => '🍌 Nano Banana Pro',
         ],
     ];
@@ -329,9 +330,10 @@ class FlowApi
     }
 
     // Igual pero cacheado 5 min (para no listar el bucket en cada carga del panel)
-    public static function r2UsoCacheado(PDO $conn)
+    public static function r2UsoCacheado(PDO $conn, $actualizar = true)
     {
         $cache = json_decode(self::ajuste($conn, 'r2_uso_cache'), true);
+        if (!$actualizar) return is_array($cache) ? $cache : null;
         if (is_array($cache) && time() - (int) ($cache['t'] ?? 0) < 300) return $cache;
         $u = self::r2Uso($conn);
         if (!empty($u['ok'])) {
@@ -647,16 +649,31 @@ class FlowApi
     /* ---------- Imágenes de entrada (Spaces) ---------- */
 
     // Solo rutas de nuestras carpetas (uploads/flow/...), que existan y sean imágenes
-    public static function limpiarEntradas(PDO $conn, $entradas)
+    public static function limpiarEntradas(PDO $conn, $entradas, $uid = null, $dispositivo = null, $estricto = false)
     {
         $e = is_array($entradas) ? $entradas : json_decode((string) $entradas, true);
         if (!is_array($e)) return [];
         $cfg = self::r2Config($conn);
         $r2base = $cfg ? $cfg['publicurl'] . '/flow/' : null;
-        $una = function ($r) use ($r2base) {
+        $una = function ($r) use ($r2base, $conn, $uid, $dispositivo) {
             $r = is_string($r) ? $r : '';
             // Imagen pública de NUESTRO bucket R2 (generada aquí): se acepta su URL
             if ($r2base && strpos($r, $r2base) === 0 && strpos($r, '..') === false && preg_match('#\.(png|jpe?g|webp|gif)$#i', $r)) return $r;
+            // Solo enlaces de imágenes entregadas y registradas en SnaveCloud.
+            if (preg_match('#^https://flow-content\.google/image/[A-Za-z0-9-]+(?:\?[^\s]*)?$#i', $r)) {
+                $sql="SELECT archivos FROM tbl_flow_trabajos WHERE tipo='imagen' AND estado='hecho'";
+                $params=[];
+                if ($uid !== null) { $sql.=" AND creado_por=?"; $params[]=(int)$uid; }
+                if ($dispositivo !== null && $dispositivo !== '') { $sql.=" AND dispositivo=?"; $params[]=(string)$dispositivo; }
+                // Comparar JSON evita aceptar coincidencias parciales de URL.
+                $st=$conn->prepare($sql); $st->execute($params);
+                while ($fila=$st->fetch(PDO::FETCH_ASSOC)) foreach ((array)json_decode($fila['archivos'],true) as $archivo) {
+                    if (($archivo['tipo'] ?? '')!=='imagen') continue;
+                    if (($archivo['url'] ?? '')===$r) return $r;
+                    if (($archivo['fuente_flow'] ?? '')===$r) return !empty($archivo['ruta']) ? $archivo['ruta'] : ($archivo['url'] ?? null);
+                }
+                return null;
+            }
             // Archivo local uploads/flow/...
             if (!preg_match('#^uploads/flow/[A-Za-z0-9_./-]+\.(png|jpe?g|webp|gif)$#i', $r) || strpos($r, '..') !== false) return null;
             $raiz = realpath(__DIR__ . '/../uploads/flow');
@@ -668,6 +685,11 @@ class FlowApi
         foreach (['ingredientes', 'referencias'] as $k) {
             $lista = array_values(array_filter(array_map($una, array_slice((array) ($e[$k] ?? []), 0, 10))));
             if ($lista) $out[$k] = $lista;
+        }
+        if ($estricto) {
+            $pedidas=count(FlowCola::entradasParaExtension(['entradas'=>json_encode($e)]));
+            $aceptadas=count(FlowCola::entradasParaExtension(['entradas'=>json_encode($out)]));
+            if ($pedidas!==$aceptadas) throw new InvalidArgumentException('No se pudo usar una imagen adjunta. Vuelve a adjuntarla; el pedido no se enviará sin ella.');
         }
         return $out;
     }
@@ -821,17 +843,16 @@ class FlowApi
                         continue;
                     }
                     if (count($videosALanzar) >= $maxLote) break; // no pasar del tope total ni del lote
-                    $t = self::tomarId($conn, (int) $p['id']);
-                    if (!$t) continue; // otra petición lo tomó primero
-                    $email = $pool[$idx % $nP]; // rotación simple (el tope total ya reparte)
-                    $idx++;
-                    // FAILOVER ENTRE CUENTAS: si este pedido ya se intentó antes en una
-                    // cuenta (y falló/no se generó), se manda a OTRA distinta. Así, si no
-                    // genera en rollinshayden, pasa a fabiola (y viceversa).
-                    if ($nP > 1 && !empty($t['cuenta'])) {
-                        $saltos = 0;
-                        while ($email === $t['cuenta'] && $saltos < $nP) { $email = $pool[$idx % $nP]; $idx++; $saltos++; }
+                    $email = ''; $idxAntes = $idx;
+                    for ($salto=0; $salto<$nP; $salto++) {
+                        $candidata = $pool[$idx % $nP]; $idx++;
+                        $stOcupada = $conn->prepare("SELECT COUNT(*) FROM tbl_flow_trabajos WHERE estado = 'procesando' AND tipo <> 'imagen' AND cuenta = ?");
+                        $stOcupada->execute([$candidata]);
+                        if ((int) $stOcupada->fetchColumn() < $simul) { $email = $candidata; break; }
                     }
+                    if ($email === '') break;
+                    $t = self::tomarId($conn, (int) $p['id'], $email);
+                    if (!$t) { $idx = $idxAntes; continue; }
                     $videosALanzar[] = ['t' => $t, 'email' => $email];
                 }
                 // Dispara el lote de envíos en paralelo y guarda cada jobid apenas llega.
@@ -861,11 +882,9 @@ class FlowApi
 
     // Pasa un pedido CONCRETO de 'pendiente' a 'procesando' (atómico). null si
     // otra petición ya lo tomó mientras tanto.
-    private static function tomarId(PDO $conn, $id)
+    private static function tomarId(PDO $conn, $id, $cuenta = '')
     {
-        $st = $conn->prepare("UPDATE tbl_flow_trabajos SET estado = 'procesando', tomado_en = NOW(), operacion = '' WHERE id = ? AND estado = 'pendiente'");
-        $st->execute([(int) $id]);
-        return $st->rowCount() ? FlowCola::buscar($conn, (int) $id) : null;
+        return FlowCola::reservarPedido($conn, $id, $cuenta);
     }
 
     // Round-robin con failover: prueba las cuentas del pool hasta que una acepte el
@@ -883,14 +902,24 @@ class FlowApi
         if ($n > 1 && !empty($t['cuenta'])) {
             usort($orden, function ($a, $b) use ($t) { return ($a === $t['cuenta'] ? 1 : 0) - ($b === $t['cuenta'] ? 1 : 0); });
         }
-        $soloSinCreditos = true;
+        $soloSinCreditos = true; $sinHueco = false;
         foreach ($orden as $email) {
+            if ($t['tipo'] !== 'imagen') {
+                $ocup = $conn->prepare("SELECT COUNT(*) FROM tbl_flow_trabajos WHERE estado = 'procesando' AND tipo <> 'imagen' AND cuenta = ? AND id <> ?");
+                $ocup->execute([$email, (int) $t['id']]);
+                if ((int) $ocup->fetchColumn() >= max(1, (int) FlowCola::config($conn)['simultaneos'])) { $sinHueco = true; continue; }
+                $conn->prepare("UPDATE tbl_flow_trabajos SET cuenta = ? WHERE id = ? AND estado = 'procesando'")->execute([$email, (int) $t['id']]);
+            }
             $res = $t['tipo'] === 'imagen'
                 ? self::generarImagen($conn, $token, $email, $t, $modelo, $entradas)
                 : self::lanzarVideo($conn, $token, $email, $t, $modelo, $entradas);
             if ($res === 'sincreditos') continue;                     // esa cuenta sin créditos: prueba otra
             if ($res === 'cuenta') { $soloSinCreditos = false; continue; } // config: prueba otra
             return; // ok / esperar / fallo (ya resuelto)
+        }
+        if ($sinHueco) {
+            $conn->prepare("UPDATE tbl_flow_trabajos SET estado = 'pendiente', tomado_en = NULL, operacion = '', mensaje = 'Esperando una cuenta con capacidad.' WHERE id = ? AND estado = 'procesando'")->execute([(int) $t['id']]);
+            return;
         }
         if ($soloSinCreditos) {
             // Ninguna cuenta tiene créditos para ESTE modelo -> se RECHAZA (no se usa el gratis
@@ -901,7 +930,7 @@ class FlowApi
             return;
         }
         // Problema de configuración (token/permiso/conexión): vuelve a la espera y frena 1 min
-        $conn->prepare("UPDATE tbl_flow_trabajos SET estado = 'pendiente', tomado_en = NULL, operacion = '', mensaje = 'Esperando: las cuentas tienen un problema de configuración.' WHERE id = ?")
+        $conn->prepare("UPDATE tbl_flow_trabajos SET estado = 'pendiente', tomado_en = NULL, operacion = '', mensaje = 'Esperando: las cuentas tienen un problema de configuración.' WHERE id = ? AND estado = 'procesando'")
              ->execute([(int) $t['id']]);
         self::guardarAjuste($conn, 'api_error', 'Las cuentas de Google Flow fallaron (token/permiso/conexión).');
         self::guardarAjuste($conn, 'api_bloqueo', time());
@@ -941,7 +970,7 @@ class FlowApi
             self::fallar($conn, $t, 'Núcleo SNAVE no devolvió el trabajo.', $codigo);
             return 'fallo';
         }
-        $conn->prepare("UPDATE tbl_flow_trabajos SET operacion = ?, cuenta = ?, mensaje = '' WHERE id = ?")->execute([mb_substr((string) $jobId, 0, 255), mb_substr((string) $email, 0, 190), (int) $t['id']]);
+        $conn->prepare("UPDATE tbl_flow_trabajos SET operacion = ?, cuenta = ?, mensaje = '' WHERE id = ? AND estado = 'procesando'")->execute([mb_substr((string) $jobId, 0, 255), mb_substr((string) $email, 0, 190), (int) $t['id']]);
         self::guardarAjuste($conn, 'api_error', '');
         return 'esperar';
     }
@@ -1016,7 +1045,7 @@ class FlowApi
         }
         $jobId = is_array($j) ? ($j['jobid'] ?? ($j['jobId'] ?? '')) : '';
         if ($jobId === '') { self::fallar($conn, $r['t'], 'Núcleo SNAVE no devolvió el trabajo.', $codigo); return; }
-        $conn->prepare("UPDATE tbl_flow_trabajos SET operacion = ?, cuenta = ?, mensaje = '' WHERE id = ?")
+        $conn->prepare("UPDATE tbl_flow_trabajos SET operacion = ?, cuenta = ?, mensaje = '' WHERE id = ? AND estado = 'procesando'")
              ->execute([mb_substr((string) $jobId, 0, 255), mb_substr((string) $r['email'], 0, 190), (int) $r['t']['id']]);
         self::guardarAjuste($conn, 'api_error', '');
     }
@@ -1027,7 +1056,7 @@ class FlowApi
             'model'       => $modelo,
             'email'       => $email,
             'prompt'      => (string) $t['prompt'],
-            'aspectRatio' => $t['formato'] === '9:16' ? 'portrait' : 'landscape',
+            'aspectRatio' => ['9:16' => 'portrait', '16:9' => 'landscape'][$t['formato']] ?? $t['formato'],
             'duration'    => (int) $t['segundos'] ?: 8,
             'count'       => max(1, min(4, (int) $t['cantidad'])),
             'async'       => true,
@@ -1111,7 +1140,7 @@ class FlowApi
             'model'       => $modelo,
             'email'       => $email,
             'prompt'      => (string) $t['prompt'],
-            'aspectRatio' => $t['formato'] === '9:16' ? 'portrait' : 'landscape',
+            'aspectRatio' => ['9:16' => 'portrait', '16:9' => 'landscape'][$t['formato']] ?? $t['formato'],
             'count'       => max(1, min(4, (int) $t['cantidad'])),
         ];
         // Imagen-a-imagen: referencias + ingredientes -> reference_1..reference_10
@@ -1134,7 +1163,7 @@ class FlowApi
         $guardadas = 0;
         foreach ((array) ($j['media'] ?? []) as $m) {
             $img = $m['image']['generatedImage'] ?? [];
-            if (!empty($img['fifeUrl']) && self::descargarUrl($conn, $t, $img['fifeUrl'], 'jpg', 'imagen')) { $guardadas++; continue; }
+            if (!empty($img['fifeUrl'])) { self::anotarArchivoUrl($conn, $t['id'], $img['fifeUrl'], 'imagen', true); $guardadas++; continue; }
             if (!empty($img['encodedImage']) && self::guardarBytes($conn, $t, base64_decode($img['encodedImage']), 'image/jpeg')) $guardadas++;
         }
         if ($guardadas) {
@@ -1189,7 +1218,7 @@ class FlowApi
     private static function fallar(PDO $conn, array $t, $mensaje, $codigo = 0, $rechazo = false)
     {
         if (in_array($codigo, [401, 402, 403, 404], true)) {
-            $conn->prepare("UPDATE tbl_flow_trabajos SET estado = 'pendiente', tomado_en = NULL, operacion = '', mensaje = 'Esperando: el generador tiene un problema de configuración.' WHERE id = ?")
+            $conn->prepare("UPDATE tbl_flow_trabajos SET estado = 'pendiente', tomado_en = NULL, operacion = '', mensaje = 'Esperando: el generador tiene un problema de configuración.' WHERE id = ? AND estado = 'procesando'")
                  ->execute([(int) $t['id']]);
             self::guardarAjuste($conn, 'api_error', $mensaje);
             self::guardarAjuste($conn, 'api_error_en', time());
@@ -1197,7 +1226,7 @@ class FlowApi
             return;
         }
         $transitorio = $codigo === 0 || $codigo === 429 || $codigo >= 500;
-        $conn->prepare("UPDATE tbl_flow_trabajos SET operacion = '' WHERE id = ?")->execute([(int) $t['id']]);
+        $conn->prepare("UPDATE tbl_flow_trabajos SET operacion = '' WHERE id = ? AND estado = 'procesando'")->execute([(int) $t['id']]);
         FlowCola::terminar($conn, (int) $t['id'], false, $mensaje, $transitorio, $rechazo && !$transitorio);
         if ($codigo === 429 || $codigo === 0) { self::guardarAjuste($conn, 'api_error', $mensaje); self::guardarAjuste($conn, 'api_error_en', time()); }
     }
@@ -1217,12 +1246,13 @@ class FlowApi
 
     private static function anotarArchivo(PDO $conn, $id, $ruta, $tipo)
     {
+        FlowCola::vencerAtrasados($conn);
         $st = $conn->prepare("SELECT archivos FROM tbl_flow_trabajos WHERE id = ?");
         $st->execute([(int) $id]);
         $lista = json_decode((string) $st->fetchColumn(), true);
         $lista = is_array($lista) ? $lista : [];
         $lista[] = ['ruta' => $ruta, 'tipo' => $tipo];
-        $conn->prepare("UPDATE tbl_flow_trabajos SET archivos = ? WHERE id = ?")->execute([json_encode($lista), (int) $id]);
+        $conn->prepare("UPDATE tbl_flow_trabajos SET archivos = ? WHERE id = ? AND estado IN ('pendiente', 'procesando')")->execute([json_encode($lista), (int) $id]);
     }
 
     // Igual, pero para un archivo que vive en una URL (p.ej. Cloudflare R2, permanente).
@@ -1230,18 +1260,21 @@ class FlowApi
     // se baja a R2/local en segundo plano, antes de que caduque: ver migrarPendientesR2).
     private static function anotarArchivoUrl(PDO $conn, $id, $url, $tipo, $temp = false)
     {
+        FlowCola::vencerAtrasados($conn);
         $st = $conn->prepare("SELECT archivos FROM tbl_flow_trabajos WHERE id = ?");
         $st->execute([(int) $id]);
         $lista = json_decode((string) $st->fetchColumn(), true);
         $lista = is_array($lista) ? $lista : [];
         $item = ['url' => $url, 'tipo' => $tipo];
-        if ($temp) $item['temp'] = 1;
+        if ($temp) { $item['temp'] = 1; $item['entregado_en'] = time(); $item['conservar_desde'] = time() + 180; }
         $lista[] = $item;
-        $conn->prepare("UPDATE tbl_flow_trabajos SET archivos = ? WHERE id = ?")->execute([json_encode($lista, JSON_UNESCAPED_SLASHES), (int) $id]);
+        $conn->prepare("UPDATE tbl_flow_trabajos SET archivos = ? WHERE id = ? AND estado IN ('pendiente', 'procesando')")->execute([json_encode($lista, JSON_UNESCAPED_SLASHES), (int) $id]);
     }
 
     private static function guardarBytes(PDO $conn, array $t, $bytes, $mime)
     {
+        $actual = FlowCola::buscar($conn, (int) $t['id']);
+        if (!$actual || !in_array($actual['estado'], ['pendiente', 'procesando'], true)) return false;
         if (!is_string($bytes) || $bytes === '') return false;
         $ext = ['video/mp4' => 'mp4', 'image/png' => 'png', 'image/jpeg' => 'jpg', 'image/webp' => 'webp'][$mime] ?? ($t['tipo'] === 'imagen' ? 'jpg' : 'mp4');
         $nombre = sprintf('%d_%s.%s', $t['id'], bin2hex(random_bytes(6)), $ext);
@@ -1308,11 +1341,25 @@ class FlowApi
     // Google (marcada temp=1). Aquí se bajan a R2 (o local) y se cambia el enlace
     // al permanente, antes de que la URL de Google caduque. Idempotente y suave:
     // pocas a la vez, reintenta si aún no responde y se rinde tras varios intentos.
+    // Devuelve una referencia permanente; si R2 falla conserva la URL actual.
+    public static function almacenarEntrega(PDO $conn, $id, $bytes, $mime)
+    {
+        if (!is_string($bytes) || strlen($bytes) < 1000 || !isset(FlowCola::TIPOS_ARCHIVO[$mime])) return null;
+        $ext = FlowCola::TIPOS_ARCHIVO[$mime]; $tipo = strpos($mime, 'video/') === 0 ? 'video' : 'imagen';
+        $nombre = sprintf('%d_%s.%s', (int) $id, bin2hex(random_bytes(6)), $ext);
+        if (self::r2Activo($conn)) {
+            $url = self::subirR2($conn, $bytes, $mime, 'flow/' . $nombre);
+            return $url ? ['url' => $url, 'tipo' => $tipo] : null;
+        }
+        if (file_put_contents(self::carpeta() . '/' . $nombre, $bytes) === false) return null;
+        return ['ruta' => FlowCola::CARPETA . '/' . $nombre, 'tipo' => $tipo];
+    }
+
     public static function migrarPendientesR2(PDO $conn)
     {
         $rows = $conn->query(
             "SELECT id, archivos FROM tbl_flow_trabajos
-             WHERE estado = 'hecho' AND archivos LIKE '%\"temp\":1%'
+             WHERE estado = 'hecho' AND terminado_en <= DATE_SUB(NOW(), INTERVAL 3 MINUTE) AND archivos LIKE '%\"temp\":1%' AND archivos NOT LIKE '%\"via_extension\":true%'
              ORDER BY id LIMIT 2"
         )->fetchAll(PDO::FETCH_ASSOC);
         foreach ($rows as $r) {
@@ -1321,28 +1368,21 @@ class FlowApi
             $cambio = false;
             foreach ($lista as $i => $item) {
                 if (empty($item['temp']) || empty($item['url'])) continue;
+                if (!empty($item['via_extension']) || time() < (int) ($item['conservar_desde'] ?? 0)) continue;
+                if (time() < (int) ($item['reintentar_en'] ?? 0)) continue;
                 $tipo = $item['tipo'] ?? 'video';
                 $ext  = $tipo === 'imagen' ? 'jpg' : 'mp4';
                 $mime = $tipo === 'imagen' ? 'image/jpeg' : 'video/mp4';
                 $bytes = self::bajarBytes($item['url']);
                 if ($bytes === null) {
-                    // Aún no responde (o ya caducó): se reintenta unas veces y luego
-                    // se deja la URL de Google mientras siga viva (quitando la marca).
+                    // Conserva el enlace y reintenta sin bloquear la visualización.
                     $try = (int) ($item['try'] ?? 0) + 1;
                     $lista[$i]['try'] = $try;
-                    if ($try >= 8) unset($lista[$i]['temp']);
+                    $lista[$i]['reintentar_en'] = time() + min(300, $try * 30);
                     $cambio = true;
                     continue;
                 }
-                $nombre = sprintf('%d_%s.%s', (int) $r['id'], bin2hex(random_bytes(6)), $ext);
-                $nuevo = null;
-                if (self::r2Activo($conn)) {
-                    $url = self::subirR2($conn, $bytes, $mime, 'flow/' . $nombre);
-                    if ($url) $nuevo = ['url' => $url, 'tipo' => $tipo];
-                }
-                if (!$nuevo && file_put_contents(self::carpeta() . '/' . $nombre, $bytes) !== false) {
-                    $nuevo = ['ruta' => FlowCola::CARPETA . '/' . $nombre, 'tipo' => $tipo];
-                }
+                $nuevo = self::almacenarEntrega($conn, $r['id'], $bytes, $mime);
                 if ($nuevo) { $lista[$i] = $nuevo; $cambio = true; }
                 else { $lista[$i]['try'] = (int) ($item['try'] ?? 0) + 1; $cambio = true; }
             }

@@ -12,6 +12,7 @@
 if (session_status() == PHP_SESSION_NONE) {
     session_start();
 }
+header('Cache-Control: no-store');
 require_once __DIR__ . '/dashboard/config/conexion.php';
 require_once __DIR__ . '/dashboard/class/flowcola.php';
 FlowCola::asegurarTablas($conn);
@@ -35,12 +36,16 @@ $guardarFallos = function ($f) use ($conn, $ipClave) {
 
 // Salir
 if (isset($_GET['salir']) && hash_equals($_SESSION['flow_login_csrf'], (string) $_GET['salir'])) {
-    unset($_SESSION['flow_acceso_id'], $_SESSION['flow_cliente_id']);
-    header('Location: flow');
+    unset($_SESSION['flow_admin_id'], $_SESSION['flow_acceso_id'], $_SESSION['flow_cliente_id'],
+          $_SESSION['flow_csrf'], $_SESSION['flow_flash'], $_SESSION['flow_ultimo_crear'], $_SESSION['flow_ultimos_ajustes']);
+    $_SESSION['flow_sso_desactivado'] = true;
+    $_SESSION['flow_login_csrf'] = bin2hex(random_bytes(16));
+    session_regenerate_id(true);
+    header('Location: /flow');
     exit;
 }
 
-// Entrar
+// Entrar: el tipo elegido determina qué cuenta se valida.
 $errorLogin = '';
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && ($_POST['accion'] ?? '') === 'entrar') {
     $fallos = $leerFallos();
@@ -49,45 +54,34 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && ($_POST['accion'] ?? '') ==
     } elseif ($fallos['n'] >= 5) {
         $errorLogin = 'Demasiados intentos fallidos. Espera 15 minutos y vuelve a probar.';
     } else {
-        // 0) ADMIN del panel (rol 1 / 5): entra a /flow con su cuenta para ver y
-        //    crear sin el peso del panel. Ve TODO el contenido.
-        $adm = FlowCola::entrarAdmin($conn, $_POST['correo'] ?? '', $_POST['clave'] ?? '');
-        if ($adm) {
+        $modoAdmin = ($_POST['tipo_acceso'] ?? 'cliente') === 'admin';
+        $adm = $cli = $a = null;
+        if ($modoAdmin) {
+            $adm = FlowCola::entrarAdmin($conn, $_POST['correo'] ?? '', $_POST['clave'] ?? '');
+        } else {
+            // Prioridad al acceso público creado por el administrador.
+            $a = FlowCola::entrarAcceso($conn, $_POST['correo'] ?? '', $_POST['clave'] ?? '');
+            if (!$a) {
+                $cli = FlowCola::entrarCliente($conn, $_POST['correo'] ?? '', $_POST['clave'] ?? '');
+                if ($cli && !FlowCola::clienteFlowActivo($conn, (int) $cli['id'])) {
+                    $cli = null; $errorLogin = 'Tu cuenta no tiene habilitado el servicio Flow. Pídeselo al administrador.';
+                }
+            }
+        }
+        if ($adm || $cli || $a) {
             session_regenerate_id(true);
-            unset($_SESSION['flow_acceso_id'], $_SESSION['flow_cliente_id']);
-            $_SESSION['flow_admin_id'] = (int) $adm['id'];
+            unset($_SESSION['flow_admin_id'], $_SESSION['flow_cliente_id'], $_SESSION['flow_acceso_id']);
+            if ($adm) $_SESSION['flow_admin_id'] = (int) $adm['id'];
+            elseif ($cli) $_SESSION['flow_cliente_id'] = (int) $cli['id'];
+            else $_SESSION['flow_acceso_id'] = (int) $a['id'];
+            $_SESSION['flow_sso_desactivado'] = true;
             $conn->prepare("DELETE FROM tbl_flow_ajustes WHERE clave = ?")->execute([$ipClave]);
-            header('Location: flow');
+            header('Location: /flow');
             exit;
         }
-        // 1) Cuenta del panel (cliente o partner) con el servicio Flow habilitado
-        $cli = FlowCola::entrarCliente($conn, $_POST['correo'] ?? '', $_POST['clave'] ?? '');
-        if ($cli) {
-            if (!FlowCola::clienteFlowActivo($conn, (int) $cli['id'])) {
-                $errorLogin = 'Tu cuenta no tiene habilitado el servicio Flow. Pídeselo al administrador.';
-            } else {
-                session_regenerate_id(true);
-                unset($_SESSION['flow_acceso_id']);
-                $_SESSION['flow_cliente_id'] = (int) $cli['id'];
-                $conn->prepare("DELETE FROM tbl_flow_ajustes WHERE clave = ?")->execute([$ipClave]);
-                header('Location: flow');
-                exit;
-            }
-        } else {
-            // 2) Acceso de la página pública (correo + contraseña aparte, legacy)
-            $a = FlowCola::entrarAcceso($conn, $_POST['correo'] ?? '', $_POST['clave'] ?? '');
-            if ($a) {
-                session_regenerate_id(true);
-                unset($_SESSION['flow_cliente_id']);
-                $_SESSION['flow_acceso_id'] = (int) $a['id'];
-                $conn->prepare("DELETE FROM tbl_flow_ajustes WHERE clave = ?")->execute([$ipClave]);
-                header('Location: flow');
-                exit;
-            }
-            $fallos['n']++;
-            $guardarFallos($fallos);
-            $errorLogin = 'Correo o contraseña incorrectos, o no tienes acceso a Flow.';
-        }
+        $fallos['n']++;
+        $guardarFallos($fallos);
+        $errorLogin = $errorLogin ?: 'Correo o contraseña incorrectos, o no tienes acceso a Flow.';
     }
 }
 
@@ -129,7 +123,7 @@ if (!empty($_SESSION['flow_admin_id'])) {
 
 // SSO: si YA está logueado en el panel de SnaveCloud como cliente/partner con el
 // servicio Flow activo, entra directo a /flow (sin volver a escribir su contraseña).
-if (!$cliente && !$acceso && !$admin && !empty($_SESSION['user_id'])) {
+if (!$cliente && !$acceso && !$admin && empty($_SESSION['flow_sso_desactivado']) && !empty($_SESSION['user_id'])) {
     $uid = (int) $_SESSION['user_id'];
     $rol = (int) ($_SESSION['user_role'] ?? 0);
     if (in_array($rol, [1, 5], true)) {
@@ -181,8 +175,8 @@ if (!$acceso && !$cliente && !$admin) {
         .fp-login h1 { margin:0 0 4px; font-size:1.5rem; }
         .fp-login p { margin:0 0 20px; color:#64748b; font-size:.9rem; }
         .fp-login label { display:block; font-weight:700; font-size:.85rem; margin:0 0 6px; }
-        .fp-login input { width:100%; box-sizing:border-box; border:1px solid #eceef4; border-radius:14px; padding:12px 14px; font:inherit; margin-bottom:14px; outline:none; }
-        .fp-login input:focus { border-color:#6d00eb; box-shadow:0 0 0 3px rgba(109,0,235,.12); }
+        .fp-login select, .fp-login input { width:100%; box-sizing:border-box; border:1px solid #eceef4; border-radius:14px; padding:12px 14px; font:inherit; margin-bottom:14px; outline:none; }
+        .fp-login select:focus, .fp-login input:focus { border-color:#6d00eb; box-shadow:0 0 0 3px rgba(109,0,235,.12); }
         .fp-login button { width:100%; border:0; border-radius:14px; padding:13px; font:inherit; font-weight:800; cursor:pointer;
                            background:linear-gradient(90deg,#00ff88,#00d471); color:#064e3b; box-shadow:0 10px 20px -5px rgba(0,255,136,.45); }
         .fp-error { background:#fef2f2; border:1px solid #fecaca; color:#991b1b; border-radius:12px; padding:10px 12px; font-size:.85rem; margin-bottom:14px; }
@@ -190,10 +184,15 @@ if (!$acceso && !$cliente && !$admin) {
     <div class="fp-barra"><div class="fp-marca">SnaveCloud <span>· Flow</span></div></div>
     <form method="post" class="fp-login" autocomplete="on">
         <h1>🎬 Crear con Flow</h1>
-        <p>Entra con tu cuenta de SnaveCloud (tu correo y contraseña).</p>
+        <p>Entra con el correo y la contraseña de tu acceso.</p>
         <?php if ($errorLogin): ?><div class="fp-error"><?= $h($errorLogin) ?></div><?php endif; ?>
         <input type="hidden" name="csrf" value="<?= $h($_SESSION['flow_login_csrf']) ?>">
         <input type="hidden" name="accion" value="entrar">
+        <label for="tipo_acceso">Entrar como</label>
+        <select name="tipo_acceso" id="tipo_acceso">
+            <option value="cliente" <?= ($_POST['tipo_acceso'] ?? 'cliente') !== 'admin' ? 'selected' : '' ?>>Cliente</option>
+            <option value="admin" <?= ($_POST['tipo_acceso'] ?? '') === 'admin' ? 'selected' : '' ?>>Administrador</option>
+        </select>
         <label for="correo">Correo</label>
         <input type="email" name="correo" id="correo" required autofocus autocomplete="username" value="<?= $h($_POST['correo'] ?? '') ?>">
         <label for="clave">Contraseña</label>
@@ -220,7 +219,7 @@ $FR_PUBLICO = [
             <div class="fp-marca">SnaveCloud <span>· Flow</span></div>
             <div class="fp-usuario">
                 <span>👤 <?= $h($yoNombre) ?></span>
-                <a href="flow?salir=<?= $h($_SESSION['flow_login_csrf']) ?>">Salir</a>
+                <a href="/flow?salir=<?= $h($_SESSION['flow_login_csrf']) ?>">Salir</a>
             </div>
         </div>
         <?php

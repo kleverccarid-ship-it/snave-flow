@@ -22,6 +22,8 @@ if (session_status() == PHP_SESSION_NONE) {
 }
 require_once __DIR__ . '/config/conexion.php';
 require_once __DIR__ . '/class/flowcola.php';
+require_once __DIR__ . '/class/FlowPrivado.php';
+require_once __DIR__ . '/class/FlowEstado.php';
 require_once __DIR__ . '/class/flow_api.php';
 
 // DOS MODOS. Dentro del panel (dashboard/flow-cola), con la sesión del panel.
@@ -29,8 +31,8 @@ require_once __DIR__ . '/class/flow_api.php';
 // correo y la contraseña del acceso y deja aquí $FR_PUBLICO antes de incluir
 // esta página. En modo público no se carga nada del panel (ni su menú ni su login).
 $frPublico = $GLOBALS['FR_PUBLICO'] ?? null;
-$frBase    = $frPublico ? 'flow' : 'flow-cola';   // a dónde apuntan formularios y redirecciones
-$frMedia   = $frPublico ? 'dashboard/' : '';      // la página pública está en la raíz, los archivos en dashboard/
+$frBase    = $frPublico ? '/flow' : 'flow-cola';   // a dónde apuntan formularios y redirecciones
+$frMedia   = $frPublico ? '/dashboard/' : '';      // la página pública está en la raíz, los archivos en dashboard/
 // En el PANEL (/dashboard/flow-cola) NO se cargan reproductores de video: eran lo
 // que hacía la página pesada (y además el panel ya carga global.php ~890 KB). Se
 // muestra una miniatura liviana con enlace para abrir/descargar; para VER y CREAR
@@ -109,7 +111,9 @@ if ($frPublico && $frDeviceId && isset($frPublico['uid'])) {
 // Admin: ve todo y pone las reglas. Cliente/partner: solo si el admin lo activó.
 // Acceso público: ya lo validó flow.php. Todos generan en SU cuenta de Flow con
 // SU extensión, y los que no son admin solo ven y tocan lo suyo.
-$esAdmin = !$frPublico && in_array($user_role, FlowCola::ROLES_ADMIN, true);
+$frVerCuenta = in_array($user_role, FlowCola::ROLES_ADMIN, true);
+$esAdmin = !$frPublico && $frVerCuenta;
+$frTodos = $frVerCuenta && $frPublico && isset($_GET['admin_todos']);
 // PANEL "solo números": el admin, en /dashboard/flow-cola, ve un TABLERO de totales
 // + lo técnico (conexión, reglas, cron, proceso en vivo), SIN la galería ni el
 // cuadro de crear. La creación visual vive en /flow. (En /flow esto es false.)
@@ -142,6 +146,7 @@ define('FLOW_MODELOS', $frListaModelos);
 // Responde y, si $avanzar, DESPUÉS de responder hace avanzar la generación con
 // Google (class/flow_api.php): quien espera la respuesta no nota la demora.
 $frAvanzar = function () use ($conn) {
+    if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
     if (function_exists('fastcgi_finish_request')) fastcgi_finish_request();
     elseif (function_exists('litespeed_finish_request')) litespeed_finish_request();
     FlowApi::avanzar($conn);
@@ -151,6 +156,7 @@ $frJson = function ($datos, $codigo = 200, $avanzar = false) use ($frAvanzar) {
     http_response_code($codigo);
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store');
+    if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
     echo json_encode($datos, JSON_UNESCAPED_UNICODE);
     if ($avanzar) $frAvanzar();
     exit;
@@ -168,20 +174,22 @@ if ($esPeticionSpace) {
             KEY idx_dueno (dueno)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     );
+    FlowPrivado::asegurarSpaces($conn);
+    $spaceDisp=(string)($frDisp??'');
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && !hash_equals($_SESSION['flow_csrf'], (string) ($_POST['csrf'] ?? ''))) {
         $frJson(['error' => 'La página caducó. Recárgala y vuelve a intentarlo.'], 403);
     }
     // Lista de tus Spaces, o uno con sus nodos (?spaces=ID)
     if (isset($_GET['spaces'])) {
         if ((int) $_GET['spaces'] > 0) {
-            $st = $conn->prepare("SELECT id, nombre, datos FROM tbl_flow_spaces WHERE id = ? AND dueno = ?");
-            $st->execute([(int) $_GET['spaces'], $user_id]);
+            $st = $conn->prepare("SELECT id, nombre, datos FROM tbl_flow_spaces WHERE id = ? AND dueno = ? AND dispositivo = ?");
+            $st->execute([(int) $_GET['spaces'], $user_id,$spaceDisp]);
             $s = $st->fetch(PDO::FETCH_ASSOC);
             if (!$s) $frJson(['error' => 'Ese Space ya no existe.'], 404);
             $frJson(['id' => (int) $s['id'], 'nombre' => $s['nombre'], 'datos' => json_decode((string) $s['datos'], true)]);
         }
-        $st = $conn->prepare("SELECT id, nombre FROM tbl_flow_spaces WHERE dueno = ? ORDER BY actualizado DESC, id DESC");
-        $st->execute([$user_id]);
+        $st = $conn->prepare("SELECT id, nombre FROM tbl_flow_spaces WHERE dueno = ? AND dispositivo = ? ORDER BY actualizado DESC, id DESC");
+        $st->execute([$user_id,$spaceDisp]);
         $frJson(['spaces' => array_map(function ($s) { return ['id' => (int) $s['id'], 'nombre' => $s['nombre']]; }, $st->fetchAll(PDO::FETCH_ASSOC))]);
     }
     // Cómo van los pedidos que lanzaron los nodos (solo los tuyos; el admin, todos)
@@ -190,6 +198,7 @@ if ($esPeticionSpace) {
         $out = [];
         if ($ids) {
             $sql = "SELECT * FROM tbl_flow_trabajos WHERE id IN (" . implode(',', $ids) . ")" . ($esAdmin ? '' : " AND creado_por = " . (int) $user_id);
+            if($frDisp!==null) $sql.=' AND dispositivo = '.$conn->quote($frDisp);
             foreach ($conn->query($sql) as $t) {
                 $archivo = null;
                 foreach (FlowCola::archivosDe($t) as $a) {
@@ -199,16 +208,16 @@ if ($esPeticionSpace) {
                         break;
                     }
                 }
-                $out[(int) $t['id']] = ['estado' => $t['estado'], 'mensaje' => $t['mensaje'], 'archivo' => $archivo];
+                $out[(int) $t['id']] = ['estado' => $t['estado'], 'mensaje' => in_array($user_role,FlowCola::ROLES_ADMIN,true) ? $t['mensaje'] : FlowEstado::mensajeCliente($t['mensaje']), 'archivo' => $archivo];
             }
         }
         $frJson(['trabajos' => $out], 200, true);
     }
     $accion = (string) $_POST['accion'];
     $sid    = (int) ($_POST['id'] ?? 0);
-    $esMio  = function ($sid) use ($conn, $user_id) {
-        $st = $conn->prepare("SELECT 1 FROM tbl_flow_spaces WHERE id = ? AND dueno = ?");
-        $st->execute([$sid, $user_id]);
+    $esMio  = function ($sid) use ($conn, $user_id,$spaceDisp) {
+        $st = $conn->prepare("SELECT 1 FROM tbl_flow_spaces WHERE id = ? AND dueno = ? AND dispositivo = ?");
+        $st->execute([$sid, $user_id,$spaceDisp]);
         return (bool) $st->fetchColumn();
     };
     if ($accion === 'space_guardar') {
@@ -217,11 +226,11 @@ if ($esPeticionSpace) {
         if (strlen($datos) > 300000 || !is_array(json_decode($datos, true))) $frJson(['error' => 'El Space es demasiado grande o llegó dañado.'], 400);
         if ($sid > 0) {
             if (!$esMio($sid)) $frJson(['error' => 'Ese Space ya no existe.'], 404);
-            $conn->prepare("UPDATE tbl_flow_spaces SET nombre = ?, datos = ?, actualizado = NOW() WHERE id = ? AND dueno = ?")
-                 ->execute([$nombre !== '' ? $nombre : 'Mi Space', $datos, $sid, $user_id]);
+            $conn->prepare("UPDATE tbl_flow_spaces SET nombre = ?, datos = ?, actualizado = NOW() WHERE id = ? AND dueno = ? AND dispositivo = ?")
+                 ->execute([$nombre !== '' ? $nombre : 'Mi Space', $datos, $sid, $user_id,$spaceDisp]);
         } else {
-            $conn->prepare("INSERT INTO tbl_flow_spaces (dueno, nombre, datos) VALUES (?, ?, ?)")
-                 ->execute([$user_id, $nombre !== '' ? $nombre : 'Mi Space', $datos]);
+            $conn->prepare("INSERT INTO tbl_flow_spaces (dueno, nombre, datos, dispositivo) VALUES (?, ?, ?, ?)")
+                 ->execute([$user_id, $nombre !== '' ? $nombre : 'Mi Space', $datos,$spaceDisp]);
             $sid = (int) $conn->lastInsertId();
         }
         $frJson(['ok' => true, 'id' => $sid]);
@@ -247,20 +256,20 @@ if ($esPeticionSpace) {
         $frJson(['ok' => true, 'ruta' => $carpeta . '/' . $nombre]);
     }
     if ($accion === 'space_borrar') {
-        $conn->prepare("DELETE FROM tbl_flow_spaces WHERE id = ? AND dueno = ?")->execute([$sid, $user_id]);
+        $conn->prepare("DELETE FROM tbl_flow_spaces WHERE id = ? AND dueno = ? AND dispositivo = ?")->execute([$sid, $user_id,$spaceDisp]);
         $frJson(['ok' => true]);
     }
     if ($accion === 'space_generar') {
         $tipo   = ($_POST['tipo'] ?? '') === 'imagen' ? 'imagen' : 'video';
-        $prompt = trim((string) ($_POST['prompt'] ?? ''));
-        if ($prompt === '') $frJson(['error' => 'Escribe el prompt o conecta un nodo de Texto.'], 400);
+        $prompt = (string) ($_POST['prompt'] ?? '');
+        if (trim($prompt) === '') $frJson(['error' => 'Escribe el prompt o conecta un nodo de Texto.'], 400);
         if (mb_strlen($prompt, 'UTF-8') > 1200) $frJson(['error' => 'El prompt pasa de 1200 caracteres. Acórtalo.'], 400);
         $modelos = FLOW_MODELOS[$tipo];
         $ajustes = [
             'tipo'     => $tipo,
             'modelo'   => (array_key_exists($_POST['modelo'] ?? '', $modelos) && ($esAdmin || FlowApi::modeloGratis($_POST['modelo'] ?? ''))) ? $_POST['modelo'] : ($esAdmin ? array_key_first($modelos) : FlowApi::DEFECTO[$tipo]),
-            'formato'  => in_array($_POST['formato'] ?? '', ['16:9', '9:16'], true) ? $_POST['formato'] : '16:9',
-            'segundos' => 8, // Solo 8 s (lo que pidió el admin)
+            'formato'  => in_array($_POST['formato'] ?? '', $tipo === 'imagen' ? ['16:9', '4:3', '1:1', '3:4', '9:16'] : ['16:9', '9:16'], true) ? $_POST['formato'] : '16:9',
+            'segundos' => in_array((int) ($_POST['segundos'] ?? 8), [4, 6, 8], true) ? (int) ($_POST['segundos'] ?? 8) : 8,
             'calidad'  => isset(FlowCola::CALIDADES['720p']) ? '720p' : (string) array_key_first(FlowCola::CALIDADES),
             'cantidad' => 1,
             'proyecto' => '',
@@ -274,14 +283,13 @@ if ($esPeticionSpace) {
         }
         // Cola ilimitada: no se bloquea al llegar al límite; el motor genera N a la
         // vez por dispositivo y el resto espera en cola. (Igual que la caja normal.)
+        try { $entradas = FlowApi::limpiarEntradas($conn, $_POST['entradas'] ?? '', $frVerCuenta ? null : $user_id, $frVerCuenta ? null : $frDisp, true); } catch (InvalidArgumentException $e) { $frJson(['error'=>$e->getMessage()],422); }
+        $ajustes['entradas']=$entradas;
         $quedan = null;
-        if (!FlowCola::crear($conn, $prompt, $ajustes, $user_id, false, $quedan, $frDisp ?? '')) $frJson(['error' => 'No se pudo crear el pedido.'], 400);
+        $creados = FlowCola::crear($conn, $prompt, $ajustes, $user_id, false, $quedan, $frDeviceId ?? $frDisp ?? '');
+        if ($creados === -1) $frJson(['error' => FlowEstado::mensajeCupo($conn,$user_id,$frDeviceId)], 422);
+        if (!$creados) $frJson(['error' => 'No se pudo crear el pedido.'], 400);
         $nuevoId = (int) $conn->lastInsertId();
-        // Las imágenes conectadas (inicio, fin, ingredientes, referencias) viajan a Google
-        $entradas = FlowApi::limpiarEntradas($conn, $_POST['entradas'] ?? '');
-        if ($entradas) {
-            $conn->prepare("UPDATE tbl_flow_trabajos SET entradas = ? WHERE id = ?")->execute([json_encode($entradas), $nuevoId]);
-        }
         FlowApi::despertar($conn); // arranca YA la generación en el próximo avance
         $frJson(['ok' => true, 'id' => $nuevoId], 200, true);
     }
@@ -316,6 +324,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     // Pegar el token que genera la extensión en el navegador (lo copias de ahí).
     if ($accion === 'fijar_token') {
+        if (!$esAdmin) $frIr(null, 'Solo el administrador puede configurar la conexión con la extensión.');
         $err = FlowCola::fijarToken($conn, $user_id, (int) $user_role, (string) ($_POST['token'] ?? ''));
         if ($err) $frIr(null, $err, [], '#conexion-ext');
         $frIr('✅ Token de la extensión guardado. Ahora pulsa "Comprobar conexión" en la extensión.', null, [], '#conexion-ext');
@@ -328,10 +337,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'tipo'     => $tipo,
             // Admin elige cualquiera; los clientes solo modelos GRATIS (si no, el gratis por defecto)
             'modelo'   => (array_key_exists($_POST['modelo'] ?? '', $modelos) && ($esAdmin || FlowApi::modeloGratis($_POST['modelo'] ?? ''))) ? $_POST['modelo'] : ($esAdmin ? array_key_first($modelos) : FlowApi::DEFECTO[$tipo]),
-            'formato'  => in_array($_POST['formato'] ?? '', ['16:9', '9:16'], true) ? $_POST['formato'] : '16:9',
-            'segundos' => 8, // Solo 8 s (lo que pidió el admin)
+            'formato'  => in_array($_POST['formato'] ?? '', $tipo === 'imagen' ? ['16:9', '4:3', '1:1', '3:4', '9:16'] : ['16:9', '9:16'], true) ? $_POST['formato'] : '16:9',
+            'segundos' => in_array((int) ($_POST['segundos'] ?? 8), [4, 6, 8], true) ? (int) ($_POST['segundos'] ?? 8) : 8,
             'calidad'  => isset(FlowCola::CALIDADES[$_POST['calidad'] ?? '']) ? $_POST['calidad'] : '720p',
             'cantidad' => max(1, min(4, (int) ($_POST['cantidad'] ?? 1))),
+            'modo_entrada' => ($_POST['modo_entrada'] ?? '') === 'fotogramas' ? 'fotogramas' : 'ingredientes',
             // '' automático, o uno de SUS proyectos (el abierto en "Tus resultados"):
             // de Flow, o creado con el "+" (id "nuevo-…", la extensión lo crea en Flow)
             'proyecto' => '',
@@ -352,25 +362,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // ANTI-DOBLE-ENVÍO: si EXACTAMENTE el mismo pedido (mismos prompts + tipo +
         // modo + proyecto) se mandó hace menos de 15 s, es un doble-clic / doble-Enter
         // → no se vuelve a crear (así no se repite el mismo prompt varias veces).
-        $firmaCrear = md5(($_POST['prompts'] ?? '') . '|' . ($ajustes['tipo'] ?? '') . '|' . ($_POST['modo_prompts'] ?? '') . '|' . ($ajustes['proyecto'] ?? ''));
+        try { $entradasCrear = FlowApi::limpiarEntradas($conn, $_POST['entradas'] ?? '', $frVerCuenta ? null : $user_id, $frVerCuenta ? null : $frDisp, true); } catch (InvalidArgumentException $e) { $frIr(null,$e->getMessage()); }
+        $rutasEntrada = array_column(FlowCola::entradasParaExtension(['entradas' => json_encode($entradasCrear)]), 'ruta');
+        if ($tipo === 'video' && $ajustes['modo_entrada'] === 'fotogramas') {
+            if (count($rutasEntrada) > 2) $frIr(null, 'Fotogramas admite dos imágenes: Inicio y Fin. Usa Ingredientes para más imágenes.');
+            $fotogramasCrear = [];
+            foreach (['inicio', 'fin'] as $rolFrame) if (!empty($entradasCrear[$rolFrame])) $fotogramasCrear[$rolFrame] = $entradasCrear[$rolFrame];
+            foreach (array_merge($entradasCrear['referencias'] ?? [], $entradasCrear['ingredientes'] ?? []) as $rutaFrame) {
+                if (!isset($fotogramasCrear['inicio'])) $fotogramasCrear['inicio'] = $rutaFrame;
+                elseif (!isset($fotogramasCrear['fin'])) $fotogramasCrear['fin'] = $rutaFrame;
+            }
+            $entradasCrear = $fotogramasCrear;
+        } else { $entradasCrear = $rutasEntrada ? ['referencias' => $rutasEntrada] : []; }
+        if ($tipo === 'video') $entradasCrear['modo_entrada'] = $ajustes['modo_entrada'];
+        if (isset($_POST['imagenes_esperadas']) && (int)$_POST['imagenes_esperadas']!==count(FlowCola::entradasParaExtension(['entradas'=>json_encode($entradasCrear)]))) $frIr(null,'Las imágenes adjuntas no llegaron completas. Vuelve a adjuntarlas antes de enviar.');
+        $ajustes['entradas']=$entradasCrear;
+        $firmaCrear = md5(($_POST['prompts'] ?? '') . '|' . ($ajustes['tipo'] ?? '') . '|' . ($_POST['modo_prompts'] ?? '') . '|' . ($ajustes['proyecto'] ?? '') . '|' . json_encode($ajustes) . '|' . json_encode($entradasCrear));
         if (($_SESSION['flow_ultimo_crear']['f'] ?? '') === $firmaCrear && time() - (int) ($_SESSION['flow_ultimo_crear']['t'] ?? 0) < 15) {
             $frIr(null, 'Ese pedido ya se envió hace un momento; no lo duplicamos.', ['ver' => $ajustes['proyecto']]);
         }
         $_SESSION['flow_ultimo_crear'] = ['f' => $firmaCrear, 't' => time()];
-        $n = FlowCola::crear($conn, $_POST['prompts'] ?? '', $ajustes, $user_id, ($_POST['modo_prompts'] ?? '') === 'varios', $quedan, $frDisp ?? '');
+        $n = FlowCola::crear($conn, $_POST['prompts'] ?? '', $ajustes, $user_id, ($_POST['modo_prompts'] ?? '') === 'varios', $quedan, $frDeviceId ?? $frDisp ?? '');
         $_SESSION['flow_ultimos_ajustes'] = $ajustes;
+        if ($n === -1) $frIr(null, FlowEstado::mensajeCupo($conn,$user_id,$frDeviceId), ['ver' => $ajustes['proyecto']]);
         if (!$n) {
             $frIr(null, 'Escribe al menos un prompt.', ['ver' => $ajustes['proyecto']]);
         }
         // Mensaje claro y los números de los trabajos nuevos, para resaltarlos en la galería
         $ultimo = (int) $conn->lastInsertId();
-        // Imágenes adjuntas desde el "+" (inicio/fin/referencia): se guardan en
-        // todos los pedidos recién creados para que viajen al generador.
-        $entradasCrear = FlowApi::limpiarEntradas($conn, $_POST['entradas'] ?? '');
-        if ($entradasCrear && $n > 0) {
-            $conn->prepare("UPDATE tbl_flow_trabajos SET entradas = ? WHERE id BETWEEN ? AND ?")
-                 ->execute([json_encode($entradasCrear), $ultimo - $n + 1, $ultimo]);
-        }
         // CADA PEDIDO EN SU PROPIO PROYECTO (como Google Flow): en modo "automático"
         // (sin un proyecto elegido), a cada video/imagen recién creado se le hace su
         // propio proyecto interno, nombrado con su prompt. Si la persona eligió un
@@ -407,6 +426,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $_SESSION['flow_flash'] = ['ok' => $msg, 'nuevos' => $nuevos];
             header('Location: ' . $frBase);
         }
+        if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
         if (function_exists('fastcgi_finish_request') || function_exists('litespeed_finish_request')) {
             if (function_exists('fastcgi_finish_request')) fastcgi_finish_request();
             else litespeed_finish_request();
@@ -417,12 +437,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
     // Reintentar y eliminar: el admin cualquiera; los demás, solo los suyos
-    if (in_array($accion, ['reintentar', 'borrar'], true) && !$esAdmin && !FlowCola::esDe($conn, $id, $user_id, $frDisp)) {
+    if (in_array($accion, ['reintentar', 'borrar', 'cancelar'], true) && !$esAdmin && !FlowCola::esDe($conn, $id, $user_id, $frDisp)) {
         $frIr(null, 'Ese pedido no es tuyo.');
     }
+    if ($accion === 'cancelar_cola_completa') {
+        if (!$esAdmin || $frPublico) $frIr(null, 'Solo el administrador desde el panel puede limpiar toda la cola.');
+        $n = FlowCola::cancelarColaCompleta($conn);
+        if ($n === false) $frIr(null, 'La cola está siendo asignada; vuelve a pulsar el botón.');
+        $frIr($n . ' pedidos pendientes cancelados y eliminados de toda la cola.');
+    }
+    if ($accion === 'cancelar_pendientes' && $frPublico) {
+        $n = FlowCola::cancelarPendientes($conn, $user_id, $frDeviceId);
+        $frIr($n . ' pedidos pendientes cancelados y eliminados.');
+    }
+    if ($accion === 'cancelar') {
+        $ok = FlowCola::cancelar($conn, $id);
+        $frIr($ok ? 'Pedido cancelado.' : null, $ok ? null : 'Flow ya confirmó la generación o el pedido terminó; no se puede cancelar.', ['ver' => $_POST['ver'] ?? null]);
+    }
     if ($accion === 'reintentar') {
-        FlowCola::reintentar($conn, $id);
-        $frIr('Vuelve a estar en espera.', null, ['ver' => $_POST['ver'] ?? null]);
+        $ok = FlowCola::reintentar($conn, $id);
+        $frIr($ok ? 'Vuelve a estar en espera.' : null, $ok ? null : 'Solo se puede reintentar un pedido fallido o rechazado. Si Flow está generando, espera su resultado.', ['ver' => $_POST['ver'] ?? null]);
     }
     if ($accion === 'borrar') {
         // Nada se elimina (ni videos ni imágenes, para nadie): se depura solo a los días de retención
@@ -443,9 +477,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $aid = (int) ($_POST['acceso_id'] ?? 0);
         // Pegar el token de la extensión para ESA cuenta (cada cuenta de Google su token)
         if ($accion === 'acceso_token') {
-            $uidAcc = FlowCola::uidDeAcceso($aid);
-            $err = $uidAcc ? FlowCola::fijarToken($conn, $uidAcc, FlowCola::ROL_ACCESO, $_POST['token'] ?? '') : 'Acceso no encontrado.';
-            $err ? $frIr(null, $err, [], '#accesos') : $frIr('✅ Token de extensión guardado para esa cuenta.', null, [], '#accesos');
+            $frIr(null, 'Los accesos usan automáticamente la extensión del administrador. Configúrala en Conexión con la extensión.', [], '#conexion-ext');
         }
         $err = null;
         if ($accion === 'acceso_crear') $err = FlowCola::crearAcceso($conn, $_POST['correo'] ?? '', $_POST['nombre'] ?? '', $_POST['clave'] ?? '');
@@ -483,6 +515,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $uid = (int) ($_POST['usuario_id'] ?? 0);
         if ($accion === 'flow_cliente_estado') { FlowCola::activarClienteFlow($conn, $uid, ($_POST['activo'] ?? '') === '1'); $frIr('Cliente actualizado.', null, [], '#clientes-flow'); }
         if ($accion === 'flow_cliente_quitar') { FlowCola::quitarClienteFlow($conn, $uid); $frIr('Servicio Flow quitado al cliente. Sus pedidos se quedan.', null, [], '#clientes-flow'); }
+    }
+    if ($accion === 'ext_rotar' && $esAdmin) {
+        FlowCola::guardarConfig($conn, ['ext_rotar' => !empty($_POST['ext_rotar'])]);
+        $frIr('Rotación de cuentas conectadas guardada.', null, [], '#conexion-ext');
     }
     if ($accion === 'config' && $esAdmin) {
         FlowCola::guardarConfig($conn, $_POST + ['clientes_activo' => 0]);
@@ -536,7 +572,7 @@ $ult = array_merge(
 );
 
 // El admin ve los pedidos de todos; los demás, solo los suyos
-$ambito     = $esAdmin ? null : $user_id;
+$ambito     = ($esAdmin || $frTodos) ? null : $user_id;
 FlowCola::vencerAtrasados($conn);
 
 // Datos en vivo para la página (la consulta cada pocos segundos, sin recargar):
@@ -546,6 +582,11 @@ FlowCola::vencerAtrasados($conn);
 // entendía la página: "conectada" = hay clave, "procesar" = no está en pausa.
 // El último error de Google solo lo ve el admin.
 $frGenerador = function () use ($conn, $esAdmin) {
+    if (!FlowApi::activa($conn)) {
+        $e = FlowCola::estadoExtensionAdmin($conn);
+        return ['nunca' => !$e || !empty($e['nunca']), 'conectada' => !empty($e['conectada']), 'activa' => !empty($e['activa']), 'procesar' => !empty($e['procesar']),
+                'mensaje' => $esAdmin ? ($e['mensaje'] ?? '') : '', 'version' => $esAdmin ? ($e['version'] ?? '') : '', 'hace' => $e['hace'] ?? null, 'trabajo' => $esAdmin ? ($e['trabajo'] ?? 0) : 0];
+    }
     $a = FlowApi::estado($conn);
     return ['nunca' => !$a['configurada'], 'conectada' => $a['configurada'], 'activa' => !$a['pausa'], 'procesar' => !$a['pausa'],
             'mensaje' => $esAdmin ? $a['error'] : '', 'version' => '', 'hace' => 0, 'trabajo' => 0];
@@ -562,10 +603,19 @@ if (isset($_GET['procesos'])) {
     if (!$esAdmin) { $frJson(['error' => 'no autorizado'], 403, false); }
     $frJson(['videos' => FlowCola::logProcesoTodos($conn, 150, $ambito, $frDisp)], 200, false);
 }
+if (isset($_GET['panel_cuentas']) || isset($_GET['panel_r2'])) {
+    if (!$esAdmin || !FlowCola::esOperadorAdmin($conn, $user_id, $user_role)) $frJson(['error' => 'no autorizado'], 403);
+    if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+    if (isset($_GET['panel_cuentas'])) $frJson(['cuentas' => FlowApi::cuentasDetalle($conn)]);
+    $frJson(['uso' => FlowApi::r2UsoCacheado($conn)]);
+}
 if (isset($_GET['vivo'])) {
+    FlowCola::vencerAtrasados($conn);
     $firmas = [];
-    foreach (FlowCola::ultimos($conn, 100, $ambito, $frDisp) as $t) {
-        $firmas[$t['id']] = $t['estado'] . '|' . (int) $t['intentos'] . '|' . count(FlowCola::archivosDe($t)) . '|' . $t['mensaje'] . '|' . $t['proyecto'];
+    $vivos=$frTodos ? FlowEstado::paginaAdmin($conn,$_GET['pagina'] ?? 1)['trabajos'] : FlowEstado::trabajosVisibles($conn,$ambito,$frDisp);
+    $contextoSeguimiento=FlowEstado::contexto($conn,$vivos);
+    foreach ($vivos as $t) {
+        $firmas[$t['id']] = $t['estado'] . '|' . (int) $t['intentos'] . '|' . count(FlowCola::archivosDe($t)) . '|' . hash('sha256',(string)$t['mensaje']) . '|' . $t['proyecto'] . '|' . (int) ($t['generacion_confirmada'] ?? 0) . '|' . md5((string) $t['archivos']) . '|' . hash('sha256',json_encode(FlowEstado::pedido($t,$contextoSeguimiento,$frVerCuenta)));
     }
     // Después de responder, la generación con Google avanza un trozo
     $frJson([
@@ -577,10 +627,12 @@ if (isset($_GET['vivo'])) {
             'enLinea'    => null,
         ],
         'firmas' => $firmas,
+        'cupo' => $frPublico?FlowEstado::cupo($conn,$user_id,$frDeviceId):null,
         // Totales para el tablero del panel (solo admin): se actualizan en vivo sin
         // bajar toda la página.
         'totales' => $esAdmin ? FlowCola::totales($conn, $ambito, $frDisp) : null,
         // Historial del proceso de todos los videos (para el monitor del panel)
+        'extensionesProceso' => $esAdmin ? FlowCola::monitorExtensiones($conn) : null,
         'historial' => $esAdmin ? FlowCola::historialProceso($conn, 60, $ambito, $frDisp) : null,
         // Monitor en vivo (solo admin): líneas de "Progreso y resultado"
         'progreso' => $esAdmin ? FlowApi::progreso($conn) : null,
@@ -596,12 +648,16 @@ if ($frPublico) {
     // flow.php ya calcula el nombre (cliente del panel o acceso legacy) y lo pasa aquí
     $nombre = trim((string) ($frPublico['nombre'] ?? ''));
     $frUsuario = ['nombre' => $nombre !== '' ? $nombre : 'Tú',
-                  'salir'  => 'flow?salir=' . ($_SESSION['flow_login_csrf'] ?? '')];
+                  'salir'  => '/flow?salir=' . ($_SESSION['flow_login_csrf'] ?? '')];
 }
 
 $config     = FlowCola::config($conn);
 $ext        = $frGenerador(); // la clave de Google del admin (ya no hay extensión)
-$trabajos   = FlowCola::ultimos($conn, 100, $ambito, $frDisp);
+$frPaginaAdmin = $frTodos ? FlowEstado::paginaAdmin($conn,$_GET['pagina'] ?? 1) : null;
+$trabajos   = $frTodos ? $frPaginaAdmin['trabajos'] : FlowEstado::trabajosVisibles($conn,$ambito,$frDisp);
+$frCupo=$frPublico?FlowEstado::cupo($conn,$user_id,$frDeviceId):null;
+$frSeguimiento=FlowEstado::contexto($conn,$trabajos);
+$frVerCuenta=in_array($user_role,FlowCola::ROLES_ADMIN,true);
 $pendientes = FlowCola::contar($conn, 'pendiente', $ambito, $frDisp);
 $enProceso  = FlowCola::contar($conn, 'procesando', $ambito, $frDisp);
 $hechos     = FlowCola::contar($conn, 'hecho', $ambito, $frDisp);
@@ -610,14 +666,19 @@ $frTotales  = $esAdmin ? FlowCola::totales($conn, $ambito, $frDisp) : null;
 // Historial del proceso de TODOS los videos, para el monitor "Progreso y resultado"
 $frHistorial = $esAdmin ? FlowCola::historialProceso($conn, 60, $ambito, $frDisp) : [];
 $proyectos  = FlowCola::proyectos($conn, $user_id, $frDisp);
+if($frDisp && !$proyectos && !$trabajos && ($_SERVER['REQUEST_METHOD']??'GET')==='GET' && !isset($_GET['proyecto_corto'])) {
+    FlowPrivado::proyectoInicial($conn,$user_id,$frDisp);
+    $proyectos=FlowCola::proyectos($conn,$user_id,$frDisp);
+}
+$frCodigoCliente=$frDisp?FlowPrivado::codigoCliente($user_id,$frDisp):null;
 $quedanHoy  = $esAdmin ? null : max(0, (int) $config['limite_diario'] - FlowCola::pedidosHoy($conn, $user_id, $frDisp));
 $enLinea    = null;
 $apiEstado  = FlowApi::estado($conn);
 // Cuentas conectadas (en vivo) para mostrarlas en la tarjeta de conexión (solo admin)
-$apiCuentas = ($esAdmin && $apiEstado['tiene_token']) ? FlowApi::cuentasDetalle($conn) : [];
+$apiCuentas = []; // Las cuentas remotas se consultan después de mostrar el panel.
 $r2Estado = $esAdmin ? FlowApi::r2Estado($conn) : null;
 $retencionDias = FlowApi::retencionDias($conn);
-$r2Uso = ($esAdmin && $r2Estado && $r2Estado['activo']) ? FlowApi::r2UsoCacheado($conn) : null;
+$r2Uso = ($esAdmin && $r2Estado && $r2Estado['activo']) ? FlowApi::r2UsoCacheado($conn, false) : null;
 $fmtBytes = function ($b) {
     $b = (int) $b;
     if ($b < 1048576) return round($b / 1024, 1) . ' KB';
@@ -666,6 +727,15 @@ if ($frNuevos !== '') {
     }
 }
 
+$frUrlsProyecto=[];
+if($frDisp) {
+    foreach($tarjetasProyecto as $p) $frUrlsProyecto[$p['id']]='/flow/project-'.FlowPrivado::codigoProyecto($user_id,$frDisp,$p['id']);
+    if(isset($_GET['proyecto_corto'])) {
+        $proyectoInicial=FlowPrivado::resolverProyecto($user_id,$frDisp,$_GET['proyecto_corto'],$tarjetasProyecto);
+        if($proyectoInicial===null) { http_response_code(404); exit('Proyecto no disponible en este espacio.'); }
+    } elseif($proyectoInicial===null && $tarjetasProyecto) $proyectoInicial=reset($tarjetasProyecto)['id'];
+} elseif(isset($_GET['proyecto_corto'])) { http_response_code(404); exit('Proyecto no disponible en este espacio.'); }
+
 $nVideos    = count(array_filter($trabajos, function ($t) { return $t['tipo'] === 'video'; }));
 $nImagenes  = count($trabajos) - $nVideos;
 
@@ -674,10 +744,10 @@ $nImagenes  = count($trabajos) - $nVideos;
 $esquema  = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
 $urlPanel = $esquema . '://' . $_SERVER['HTTP_HOST'] . rtrim(dirname(strtok($_SERVER['REQUEST_URI'], '?')), '/\\') . '/';
 // Desde la página pública (en la raíz) la API y los archivos están en dashboard/
-if ($frPublico) $urlPanel .= 'dashboard/';
+if ($frPublico) $urlPanel = $esquema.'://'.$_SERVER['HTTP_HOST'].'/dashboard/';
 // Para el admin: la dirección de la página pública y los accesos creados
 $urlPublica = preg_replace('#dashboard/$#', '', $urlPanel) . 'flow';
-$accesos = $esAdmin ? FlowCola::accesos($conn) : [];
+$accesos = $frVerCuenta ? FlowCola::accesos($conn) : [];
 $clientesFlow = $esAdmin ? FlowCola::clientesFlow($conn) : [];
 $flowServicioId = $esAdmin ? FlowCola::flowServicioId($conn) : 0;
 $catalogoServicios = [];
@@ -686,6 +756,8 @@ if ($esAdmin) {
 }
 $correoDeAcceso = [];
 foreach ($accesos as $a) $correoDeAcceso[FlowCola::uidDeAcceso($a['id'])] = $a['correo'];
+if($frVerCuenta)foreach($conn->query('SELECT id,correo FROM tbl_usuarios')->fetchAll(PDO::FETCH_ASSOC) as $u)$correoDeAcceso[(int)$u['id']]=$u['correo'];
+$frResumenGlobal=$frVerCuenta ? FlowCola::totales($conn) : null;
 
 $h = function ($s) { return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8'); };
 $csrf = $h($_SESSION['flow_csrf']);
@@ -695,8 +767,8 @@ $etiquetaModelo = function ($t) {
 };
 // Lista "Mis videos" de la barra lateral (filas con puntito de estado + nombre).
 // Se usa en la carga y el refresco en vivo la vuelve a pintar desde la página.
-$frPintarMisVideos = function (array $trabajos) use ($h) {
-    $clasePt = ['hecho' => 'ok', 'procesando' => 'proc', 'pendiente' => 'pend', 'error' => 'err', 'rechazado' => 'err'];
+$frPintarMisVideos = function (array $trabajos) use ($h,$frSeguimiento,$frVerCuenta) {
+    $clasePt = ['hecho' => 'ok', 'procesando' => 'proc', 'pendiente' => 'pend', 'error' => 'err', 'rechazado' => 'err', 'cancelado' => 'cancel'];
     $out = '';
     foreach ($trabajos as $t) {
         $cls = $clasePt[$t['estado']] ?? 'pend';
@@ -706,8 +778,9 @@ $frPintarMisVideos = function (array $trabajos) use ($h) {
         if ($nom === '') $nom = trim((string) $t['proyecto_nombre']);
         if ($nom === '') $nom = ($t['tipo'] === 'imagen' ? 'Imagen' : 'Video') . ' #' . (int) $t['id'];
         $corto = mb_strlen($nom, 'UTF-8') > 28 ? mb_substr($nom, 0, 28, 'UTF-8') . '…' : $nom;
-        $out .= '<button type="button" class="fl-vid" data-ir="' . (int) $t['id'] . '" data-proy="' . $h($t['proyecto']) . '" title="' . $h($nom) . '">'
-              . '<span class="pt ' . $cls . '"></span>'
+        $estadoLateral=$t['estado']==='cancelado'?'Cancelado · no ocupa cupo':($t['estado']==='pendiente'?'En cola':($t['estado']==='procesando'?(empty($t['generacion_confirmada'])?'Preparando · Motor SnaveCloud':'Generando · Motor SnaveCloud'):$t['estado']));
+        $out .= '<button type="button" class="fl-vid" data-ir="' . (int) $t['id'] . '" data-proy="' . $h($t['proyecto']) . '" title="' . $h(FlowEstado::pedido($t,$frSeguimiento,$frVerCuenta)['estado'].' · '.$nom) . '">'
+              . '<span class="pt ' . $cls . '">'.($t['estado']==='cancelado'?'×':'').'</span>'
               . '<span class="nm">' . $h($corto) . '</span>'
               . '<span class="tp">' . ($t['tipo'] === 'imagen' ? '🖼️' : '🎬') . '</span>'
               . '</button>';
@@ -720,6 +793,7 @@ const FLOW_ESTADOS = [
     'hecho'      => ['Listo', 'hecho'],
     'error'      => ['Falló', 'error'],
     'rechazado'  => ['Google no lo generó', 'rechazo'],
+    'cancelado'  => ['Cancelado', 'cola'],
 ];
 // Trabajos recién creados (vienen en ?nuevos=desde-hasta) para resaltarlos
 [$nuevoDesde, $nuevoHasta] = array_map('intval', array_pad(explode('-', $frNuevos), 2, 0));
@@ -948,15 +1022,29 @@ $user_id = $frUid;
     .fr .fl-flotante:hover { background:rgba(110,110,110,.8); color:#fff; }
 
     /* Resultados dentro del proyecto: como las piezas de Flow */
-    .fr .rejilla { display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:16px 12px; padding:2px 0 8px; align-items:start; }
-    .fr .job { position:relative; display:flex; flex-direction:column; gap:8px; }
+    .fr .rejilla { display:flex; flex-wrap:wrap; gap:16px 12px; padding:2px 0 8px; align-items:flex-start; }
+    .fr .job { position:relative; display:flex; flex-direction:column; gap:8px; flex:0 0 280px; max-width:100%; min-width:0; }
     .fr .job > video, .fr .job > a, .fr .job > .hueco { order:-2; }
-    .fr .job > .extra { order:-1; }
+    .fr .job > .fr-resultados-pedido { order:-2; }
+    .fr .job.varios-resultados { flex-basis:calc(var(--resultados)*280px + (var(--resultados) - 1)*12px); }
+    .fr .job.varios-resultados.vertical { flex-basis:calc(var(--resultados)*200px + (var(--resultados) - 1)*12px); }
+    .fr .fr-resultados-pedido { display:grid; grid-template-columns:repeat(var(--resultados),minmax(0,1fr)); gap:12px; min-width:0; }
+    .fr .fr-resultado { min-width:0; }
+    .fr .fr-resultado > a { display:block; }
+    .fr .fr-resultado-abrir { margin-top:6px; font-size:.75rem; color:var(--suave); }
+    .fr .job.varios-resultados .fr-resultados-pedido { grid-template-columns:repeat(var(--resultados),minmax(240px,280px)); justify-content:start; overflow-x:auto; padding-bottom:4px; }
+    .fr .job.varios-resultados.vertical .fr-resultados-pedido { grid-template-columns:repeat(var(--resultados),200px); }
+    .fr .rejilla.lista .job > .fr-resultados-pedido { width:170px; flex:none; }
+    .fr .rejilla.lista .job.varios-resultados > .fr-resultados-pedido { width:min(65vw,600px); grid-template-columns:repeat(var(--resultados),minmax(150px,1fr)); }
+    .fr .rejilla.lista .fr-resultado-abrir { display:none; }
     .fr .job > .arriba { position:absolute; top:10px; left:10px; right:10px; z-index:2; pointer-events:none; }
     .fr .job > .prompt, .fr .job > .meta, .fr .job > .acciones { padding:0 4px; }
     .fr .job.nuevo video, .fr .job.nuevo img, .fr .job.nuevo .hueco { outline:2px solid var(--verde-osc); }
     .fr .job .arriba { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
     .fr .job .arriba .id { color:#fff; font-size:.72rem; flex:1; text-shadow:0 1px 4px #07050c; }
+.fr .fr-referencias-pedido { display:flex; gap:7px; flex-wrap:wrap; padding:4px; }
+.fr .fr-referencias-pedido a { display:flex; flex-direction:column; gap:3px; align-items:center; font-size:10px; color:var(--suave); text-decoration:none; }
+.fr .fr-referencias-pedido img { width:42px !important; height:42px !important; object-fit:cover; border-radius:8px; border:1px solid var(--borde); }
     .fr .job .prompt { font-size:.86rem; line-height:1.45; color:#cdc2de; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
     .fr .job:hover .prompt { color:#e3e3e3; } /* el prompt se queda cortado a 2 líneas, no se expande */
     .fr .job video, .fr .job img, .fr .job .hueco { width:100%; aspect-ratio:16/9; border-radius:14px; background:#0d0a13; object-fit:cover; display:block; }
@@ -986,11 +1074,12 @@ $user_id = $frUid;
     .fr .job .hueco.rechazo b { font-size:.95rem; }
     .fr .job .plazo { font-weight:500; color:#dcc8ff; }
     .fr .job .plazo.tarde { color:var(--rojo); }
+    .fr .fl-vid .pt.cancel { background:transparent; width:12px; height:12px; font-size:14px; line-height:10px; color:var(--suave); }
     .fr .job .pct { font-weight:800; font-size:1.5rem; color:var(--morado); letter-spacing:-.5px; margin-top:4px; line-height:1; }
 
     /* ======= VISTA LISTA (filas compactas tipo NeuroFlix) ======= */
     .fr .rejilla.lista { display:flex; flex-direction:column; gap:8px; grid-template-columns:none; }
-    .fr .rejilla.lista .job { flex-direction:row; align-items:center; gap:12px; background:var(--panel);
+    .fr .rejilla.lista .job { flex-basis:auto; width:100%; flex-direction:row; align-items:center; gap:12px; background:var(--panel);
                               border:1px solid var(--borde); border-radius:12px; padding:8px 10px; }
     .fr .rejilla.lista .job > video, .fr .rejilla.lista .job > a, .fr .rejilla.lista .job > .hueco {
         order:0; width:112px; flex:none; aspect-ratio:16/9; border-radius:8px; max-height:none; }
@@ -1008,6 +1097,7 @@ $user_id = $frUid;
     .fr .rejilla.lista .job .hueco .emoji { font-size:1rem; }
     .fr .rejilla.lista .job .hueco b, .fr .rejilla.lista .job .hueco span:not(.pct):not(.giro):not(.emoji) { display:none; }
 
+    .fr .rejilla.lista .job .fr-resultados-pedido video, .fr .rejilla.lista .job .fr-resultados-pedido img { height:auto; }
     /* ======= LISTA "MIS VIDEOS" en la barra lateral (tipo NeuroFlix) ======= */
     .fr .fl-misvid-tit { font-size:.66rem; font-weight:800; letter-spacing:.09em; color:var(--suave); text-transform:uppercase;
                          padding:8px 12px 4px; display:flex; justify-content:space-between; align-items:center; }
@@ -1240,6 +1330,7 @@ $user_id = $frUid;
 </style>
 
 <div class="container-fluid fr-pagina">
+<script type="application/json" id="frMapaProyectos"><?= json_encode($frUrlsProyecto,JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT) ?></script>
 <div class="fr studio<?= $frPublico ? ' publico' : '' ?><?= $frPanelNumeros ? ' panel-numeros' : '' ?>">
     <!-- ================= BARRA DE ARRIBA ================= -->
     <header class="fl-top">
@@ -1278,6 +1369,9 @@ $user_id = $frUid;
             <button type="button" class="fl-icono" id="frNavActualizar" title="Actualizar"><span class="ms">refresh</span></button>
             <?php if ($esAdmin): ?><a class="fl-icono" href="#accesos" title="Accesos públicos"><span class="ms">group</span></a><?php endif; ?>
             <button type="button" class="fl-pill" data-abre-space title="Spaces: conecta nodos de Texto con Imagen y Video"><span class="ms">hub</span><span class="t">Spaces</span></button>
+            <?php if ($frCodigoCliente): ?>
+                <span class="fl-pill fr-privado" style="font-size:11px;color:#d9baff;border-color:#57347e;background:#21132f" title="Tu espacio privado de este perfil"><span class="ms">lock</span><span>Privado · <?= $h($frCodigoCliente) ?></span></span>
+            <?php endif; ?>
             <?php if ($frUsuario): ?>
                 <span class="fl-yo"><span class="fl-cuenta"><?= $h($frUsuario['nombre']) ?></span><span class="av"><?= $h(mb_strtoupper(mb_substr($frUsuario['nombre'], 0, 1, 'UTF-8'), 'UTF-8')) ?></span><a href="<?= $h($frUsuario['salir']) ?>">Salir</a></span>
             <?php else: ?>
@@ -1302,7 +1396,7 @@ $user_id = $frUid;
         </div>
         <div class="fl-sep"></div>
         <a class="it" id="frProyectoActivoFlow" href="#" target="_blank" rel="noopener" hidden style="display:none"></a>
-        <button type="button" class="it" data-abre-space><span class="ms">hub</span> Spaces</button>
+
         <?php if ($esAdmin): ?><a class="it" href="#conexion"><span class="ms">key</span> Conexión con Google</a><?php endif; ?>
         <div class="fl-abajo">
             <button type="button" class="it" data-ir-lista><span class="ms">folder_open</span> Mis proyectos</button>
@@ -1319,6 +1413,14 @@ $user_id = $frUid;
                 <h2>📊 Resumen de generación</h2>
                 <a class="fr-tab-ir" href="../flow" target="_blank" rel="noopener"><span class="ms">movie</span> Crear videos en /flow</a>
             </div>
+            <?php if (!$frPublico): ?>
+            <form method="post" style="margin:12px 0">
+                <input type="hidden" name="csrf" value="<?= $csrf ?>">
+                <input type="hidden" name="accion" value="cancelar_cola_completa">
+                <button type="submit" class="btn-borde">Cancelar y borrar toda la cola pendiente</button>
+                <p class="mini">Elimina los pendientes de todas las cuentas y dispositivos, también en /flow. Conserva los pedidos en generación y los resultados terminados.</p>
+            </form>
+            <?php endif; ?>
             <div class="fr-tab-grid">
                 <div class="fr-card ok">
                     <span class="ico"><span class="ms">movie</span></span>
@@ -1393,16 +1495,42 @@ $user_id = $frUid;
         <?php if (!empty($frFlash['ok'])): ?>
             <div class="aviso ok">✅ <?= $h($frFlash['ok']) ?></div>
         <?php endif; ?>
+        <?php if($frVerCuenta && $frPublico): ?>
+        <div class="tarjeta" style="padding:12px;margin:10px 0">
+            <b>Administración · Todos los clientes</b>
+            <p><?= (int)$frResumenGlobal['videos_ok'] ?> pedidos de video listos · <?= (int)$frResumenGlobal['imagenes_ok'] ?> pedidos de imagen listos · <?= (int)$frResumenGlobal['total'] ?> pedidos en total</p>
+            <a class="btn-borde" href="/flow?admin_todos=1">Ver todos los pedidos y sus cuentas Ultra</a>
+            <a class="btn-borde" href="/flow">Mis proyectos</a>
+            <?php if($frTodos): ?><p>Página <?= (int)$frPaginaAdmin['pagina'] ?> de <?= (int)$frPaginaAdmin['paginas'] ?> · 100 pedidos por página.
+            <?php if($frPaginaAdmin['pagina']>1): ?><a href="/flow?admin_todos=1&amp;pagina=<?= $frPaginaAdmin['pagina']-1 ?>">Anterior</a><?php endif; ?>
+            <?php if($frPaginaAdmin['pagina']<$frPaginaAdmin['paginas']): ?><a href="/flow?admin_todos=1&amp;pagina=<?= $frPaginaAdmin['pagina']+1 ?>">Siguiente</a><?php endif; ?></p><?php endif; ?>
+        </div>
+        <?php endif; ?>
+        <?php if($frVerCuenta): ?><p class="mini">Plazo de entrega desde la solicitud: <?= (int) FlowCola::minutosEntrega($config,'video','720p') ?> minutos para video 720p; <?= (int) FlowCola::minutosEntrega($config,'video','1080p') ?> para 1080p; <?= (int) FlowCola::minutosEntrega($config,'imagen') ?> para imágenes. Si no llega ningún resultado, el pedido se cancela y libera su cupo.</p><?php endif; ?>
         <!-- Aviso en vivo: se enciende si el generador no está listo o está en pausa -->
         <div class="aviso alerta aviso-ext" id="frAvisoExt"></div>
         <?php if (!empty($frAvisoDisp)): ?>
         <div class="aviso" style="background:rgba(242,139,130,.14); border:1px solid rgba(242,139,130,.5); color:#fecaca; font-weight:600; margin:0 0 6px"><?= $h($frAvisoDisp) ?></div>
         <?php endif; ?>
         <?php if ($retencionDias > 0 && !$frPanelNumeros): ?>
+        <?php if ($frVerCuenta): ?><p class="mini">Los pedidos se reparten entre las cuentas de generación disponibles. Máximo tres generaciones pendientes o en curso por dispositivo, entre videos e imágenes.</p><?php endif; ?>
         <div class="aviso" style="background:rgba(109,0,235,.12); border:1px solid rgba(109,0,235,.3); color:var(--texto); font-size:.85rem; margin:0 0 6px">⏳ Tus videos e imágenes se guardan <b><?= (int) $retencionDias ?> días</b> — descárgalos antes, después se borran automáticamente.</div>
         <?php endif; ?>
         <?php if (!empty($frFlash['err'])): ?><div class="aviso err">⚠️ <?= $h($frFlash['err']) ?></div><?php endif; ?>
 
+        <?php if ($frPublico): ?>
+        <details id="frDetalleCupo" class="tarjeta" style="padding:12px;margin:10px 0">
+            <summary style="cursor:pointer"><b id="frCupoTexto"><?= (int)$frCupo['usadas'] ?>/3 generaciones ocupadas · <?= (int)$frCupo['libres'] ?> disponibles</b></summary>
+            <div id="frCupoPedidos" class="mini" style="margin-top:8px"><?php foreach($frCupo['pedidos'] as $p): ?><div><button type="button" class="btn-borde" data-cupo-pedido="<?= (int)$p['id'] ?>">Ver pedido #<?= (int)$p['id'] ?></button> · <?= $h($p['proyecto_nombre']?:'Otro proyecto') ?> · <?= (int)$p['cantidad'] ?> plaza(s)</div><?php endforeach; ?></div>
+            <p class="mini">Cuenta los pendientes y los pedidos en curso de todos tus proyectos. Los cancelados y fallidos no ocupan cupo.</p>
+        </details>
+        <form method="post" style="margin:10px 0">
+            <input type="hidden" name="csrf" value="<?= $h($_SESSION['flow_csrf']) ?>">
+            <input type="hidden" name="accion" value="cancelar_pendientes">
+            <button type="submit" class="btn-borde">Cancelar todos los pendientes</button>
+            <span class="mini">Quita los pendientes de esta cuenta y dispositivo. Los videos en generación continúan.</span>
+        </form>
+        <?php endif; ?>
         <!-- Galería -->
         <div class="tarjeta" id="galeria">
             <!-- Vista 1: tus proyectos. Al pulsar uno se pasa a la vista 2 (sus videos) -->
@@ -1413,7 +1541,9 @@ $user_id = $frUid;
                             <span class="portada">
                                 <?php if ($p['portada']): $portSrc = !empty($p['portada']['ruta']) ? $frMedia . $p['portada']['ruta'] : $p['portada']['url']; ?>
                                     <?php if ($p['portada']['tipo'] === 'imagen'): ?><img src="<?= $h($portSrc) ?>" alt="" loading="lazy">
-                                    <?php elseif ($frSinVideo): ?><span class="vacia"><span class="ms">movie</span></span>
+                                    <?php elseif (!empty($p['portada']['temp']) && preg_match('#^https://flow\.google\.com/asb/#i',(string)($p['portada']['url']??''))): ?>
+                                <div style="min-height:160px;display:grid;place-content:center;text-align:center;padding:16px"><span class="ms">hourglass_top</span><span>Video generado</span><small>Enlace disponible en el proyecto</small></div>
+                            <?php elseif ($frSinVideo): ?><span class="vacia"><span class="ms">movie</span></span>
                                     <?php else: ?><video data-src="<?= $h($portSrc) ?>#t=0.5" preload="none" muted class="fr-lazy"></video><?php endif; ?>
                                 <?php else: ?><span class="vacia"><span class="ms"><?= $p['id'] === '' ? 'folder_special' : 'movie' ?></span></span><?php endif; ?>
                             </span>
@@ -1457,10 +1587,14 @@ $user_id = $frUid;
             <?php else: ?>
             <div class="rejilla solo-proyecto">
                 <?php if (!$frPanelNumeros): foreach ($trabajos as $t):
+                    $seguimientoPedido=FlowEstado::pedido($t,$frSeguimiento,$frVerCuenta);
+                    $frMensajePedido=$frVerCuenta?$t['mensaje']:FlowEstado::mensajeCliente($t['mensaje']);
                     [$estadoTxt, $estadoCls] = FLOW_ESTADOS[$t['estado']] ?? [ucfirst($t['estado']), 'cola'];
+                    if(in_array($t['estado'],['procesando','rechazado'],true))$estadoTxt=$seguimientoPedido['estado'];
                     $archivos = array_values(array_filter(FlowCola::archivosDe($t), function ($a) { return !empty($a['ruta']) || !empty($a['url']); }));
                     $src = function ($a) use ($frMedia) { return !empty($a['ruta']) ? $frMedia . $a['ruta'] : $a['url']; };
                     $principal = $archivos[0] ?? null;
+                    $frResultadosN = count($archivos);
                     $esNuevo = $nuevoDesde && (int) $t['id'] >= $nuevoDesde && (int) $t['id'] <= $nuevoHasta;
                     $esMio = (int) $t['creado_por'] === $user_id;
                     // Entrega máxima: desde que la extensión lo toma, la espera de las reglas + 3 min
@@ -1472,38 +1606,49 @@ $user_id = $frUid;
                     // tarjeta pasa a mostrar el video.
                     $inicioMs = ($t['tomado_en'] ? strtotime($t['tomado_en']) : time()) * 1000;
                     $esperadoSeg = $t['tipo'] === 'imagen' ? 30 : (($t['calidad'] ?? '') === '1080p' ? 300 : 150); ?>
-                <div class="job <?= $t['formato'] === '9:16' ? 'vertical' : '' ?> <?= $esNuevo ? 'nuevo' : '' ?>" data-tipo="<?= $h($t['tipo']) ?>"
-                     data-id="<?= (int) $t['id'] ?>" data-mio="<?= $esMio ? 1 : 0 ?>" data-limite="<?= $limite * 1000 ?>"
+                <div class="job <?= $frResultadosN > 1 ? 'varios-resultados' : '' ?> <?= $t['formato'] === '9:16' ? 'vertical' : '' ?> <?= $esNuevo ? 'nuevo' : '' ?>" data-tipo="<?= $h($t['tipo']) ?>"
+                     style="--resultados:<?= max(1,(int)$frResultadosN) ?>" data-id="<?= (int) $t['id'] ?>" data-mio="<?= $esMio ? 1 : 0 ?>" data-limite="<?= $limite * 1000 ?>"
                      data-inicio="<?= $inicioMs ?>" data-esperado="<?= $esperadoSeg ?>" data-proyecto="<?= $h($t['proyecto']) ?>">
                     <div class="arriba">
                         <span class="etq morado"><?= $t['tipo'] === 'imagen' ? '🖼️ Imagen' : '🎬 Video' ?></span>
                         <?php if ($esNuevo): ?><span class="etq" style="background:#dcfce7;color:#166534">Nuevo</span><?php endif; ?>
-                        <?php if ($esAdmin && (int) $t['creado_por'] !== $user_id): ?><span class="etq pago" title="Pedido de otro usuario">👤 <?= (int) $t['creado_por'] < 0
+                        <?php if ($frVerCuenta): ?><span class="etq pago" title="Pedido de otro usuario">👤 <?= (int) $t['creado_por'] < 0
                             ? $h($correoDeAcceso[(int) $t['creado_por']] ?? 'acceso borrado')   // acceso de la página pública
-                            : 'usuario #' . (int) $t['creado_por'] ?></span><?php endif; ?>
+                            : $h($correoDeAcceso[(int)$t['creado_por']] ?? ('usuario #' . (int)$t['creado_por'])) ?></span><?php endif; ?>
                         <span class="id">#<?= (int) $t['id'] ?></span>
                         <span class="estado <?= $estadoCls ?>"><?= $estadoTxt ?></span>
-                        <?php if ($esAdmin && !empty($t['cuenta'])): ?><span class="etq cuenta-gen" title="Generado en la cuenta: <?= $h($t['cuenta']) ?>">⚙️ <?= $h(explode('@', $t['cuenta'])[0]) ?></span><?php endif; ?>
+                        <?php if ($frVerCuenta && !empty($t['cuenta'])): ?><span class="etq cuenta-gen" title="<?= $h($seguimientoPedido['cuenta']) ?>">⚙️ <?= $h(filter_var($t['cuenta'],FILTER_VALIDATE_EMAIL)?explode('@',$t['cuenta'])[0]:('Motor SnaveCloud'.($seguimientoPedido['perfil']?' #'.$seguimientoPedido['perfil']:''))) ?></span><?php endif; ?>
                     </div>
                     <div class="prompt"><?= $h($t['prompt']) ?></div>
+                    <?php $frRefsPedido = FlowCola::entradasParaExtension($t); if ($frRefsPedido): ?>
+                    <div class="fr-referencias-pedido" aria-label="Imágenes del pedido">
+                        <?php foreach ($frRefsPedido as $frRef): $frRefRuta = (string) ($frRef['ruta'] ?? '');
+                            if (!preg_match('#^(https?://|uploads/flow/)#i', $frRefRuta)) continue;
+                            $frRefSrc = preg_match('#^https?://#i', $frRefRuta) ? $frRefRuta : $frMedia . $frRefRuta;
+                            $frRefEtiqueta = ['inicio'=>'Inicio', 'fin'=>'Fin', 'referencia'=>'Referencia'][$frRef['rol'] ?? 'referencia'] ?? 'Referencia'; ?>
+                        <a href="<?= $h($frRefSrc) ?>" target="_blank" rel="noopener" data-fr-imagen title="<?= $h($frRefEtiqueta) ?>">
+                            <img src="<?= $h($frRefSrc) ?>" alt="<?= $h($frRefEtiqueta) ?>" loading="lazy" decoding="async">
+                            <span><?= $h($frRefEtiqueta) ?></span>
+                        </a>
+                        <?php endforeach; ?>
+                    </div>
+                    <?php endif; ?>
 
                     <?php if ($principal): ?>
-                        <?php if ($principal['tipo'] === 'imagen'): $refImg = !empty($principal['ruta']) ? $principal['ruta'] : $principal['url']; ?>
-                            <a href="<?= $h($src($principal)) ?>" target="_blank" rel="noopener" draggable="false"><img src="<?= $h($src($principal)) ?>" alt="" loading="lazy" draggable="true" data-ref="<?= $h($refImg) ?>" title="Arrástrala al cuadro de crear para generar un video con esta imagen"></a>
-                        <?php elseif ($frSinVideo): ?>
-                            <a class="fr-verarchivo" href="<?= $h($src($principal)) ?>" target="_blank" rel="noopener" title="Abrir el video (se ve en /flow más cómodo)"><span class="ms">play_circle</span><span>Ver / descargar video</span></a>
-                        <?php else: ?>
-                            <video data-src="<?= $h($src($principal)) ?>" controls preload="none" class="fr-lazy"></video>
-                        <?php endif; ?>
-                        <?php if (count($archivos) > 1): ?>
-                            <div class="extra">
-                                <?php foreach (array_slice($archivos, 1) as $a): ?>
-                                    <a href="<?= $h($src($a)) ?>" target="_blank" rel="noopener" title="Abrir">
-                                        <?php if ($a['tipo'] === 'imagen'): ?><img src="<?= $h($src($a)) ?>" alt="" loading="lazy"><?php elseif ($frSinVideo): ?><span class="fr-minivid"><span class="ms">movie</span></span><?php else: ?><video data-src="<?= $h($src($a)) ?>" preload="none" muted class="fr-lazy"></video><?php endif; ?>
-                                    </a>
-                                <?php endforeach; ?>
+                        <div class="fr-resultados-pedido" style="--resultados:<?= (int)$frResultadosN ?>" aria-label="Resultados del mismo pedido">
+                        <?php foreach ($archivos as $frIndice => $a): ?>
+                            <div class="fr-resultado">
+                            <?php if ($a['tipo'] === 'imagen'): $refImg = !empty($a['ruta']) ? $a['ruta'] : $a['url']; ?>
+                                <a href="<?= $h($src($a)) ?>" target="_blank" rel="noopener" data-fr-imagen draggable="false"><img src="<?= $h($src($a)) ?>" alt="Resultado <?= $frIndice+1 ?>" loading="lazy" draggable="true" data-ref="<?= $h($refImg) ?>" title="Arrástrala al cuadro de crear para generar un video con esta imagen"></a>
+                            <?php elseif ($frSinVideo): ?>
+                                <a class="fr-verarchivo" href="<?= $h($src($a)) ?>" target="_blank" rel="noopener"><span class="ms">play_circle</span><span>Ver / descargar video <?= $frIndice+1 ?></span></a>
+                            <?php else: ?>
+                                <video data-src="<?= $h($src($a)) ?>" controls preload="none" class="fr-lazy" aria-label="Video <?= $frIndice+1 ?> del pedido #<?= (int)$t['id'] ?>"></video>
+                            <?php endif; ?>
+                            <?php if($frResultadosN>1): ?><a class="fr-resultado-abrir" href="<?= $h($src($a)) ?>" target="_blank" rel="noopener">Resultado <?= $frIndice+1 ?> · Abrir</a><?php endif; ?>
                             </div>
-                        <?php endif; ?>
+                        <?php endforeach; ?>
+                        </div>
                     <?php elseif ($t['estado'] === 'pendiente'):
                         // Cuántos videos del MISMO dueño+dispositivo van ANTES (cola).
                         // Las imágenes no cuentan (son ilimitadas y no hacen cola).
@@ -1522,56 +1667,67 @@ $user_id = $frUid;
                                 <span class="pct" style="font-size:1.15rem">⏳ En cola</span>
                                 <span>Hay <b><?= $frAntes ?></b> video<?= $frAntes === 1 ? '' : 's' ?> antes del tuyo</span>
                             <?php else: ?>
-                                <span class="pct" data-pct>0%</span>
-                                <span data-espera><?= $conectada ? 'Empezando a generar…' : 'En espera: el generador no está listo; se hará en cuanto lo esté.' ?></span>
+                                <span class="pct">En espera</span>
+                                <span>Esperando una cuenta disponible.</span>
                             <?php endif; ?>
-                            <?php if ((int) ($t['intentos'] ?? 0) > 0): ?><b>Intento <?= (int) $t['intentos'] + 1 ?></b><span class="mini"><?= $h($t['mensaje']) ?></span><?php endif; ?>
+                            <?php if ((int) ($t['intentos'] ?? 0) > 0): ?><b>Intento <?= (int) $t['intentos'] + 1 ?></b><span class="mini"><?= $h($frMensajePedido) ?></span><?php endif; ?>
                         </div>
                     <?php elseif ($t['estado'] === 'procesando'): ?>
                         <div class="hueco"><span class="giro"></span>
-                            <span class="pct" data-pct>0%</span>
-                            <span>Generándose…</span>
+                            <span class="pct" style="font-size:1.05rem"><?= $h($seguimientoPedido['porcentajeTexto'] ?: $seguimientoPedido['estado']) ?></span>
+                            <span><?= $h($seguimientoPedido['detalle']) ?></span>
                             <?php if ($t['tipo'] === 'video' && ($t['calidad'] ?? '') === '1080p'): ?><span class="mini">En 1080p puede tardar un poco más</span><?php endif; ?>
                         </div>
+                    <?php elseif ($t['estado'] === 'cancelado'): ?>
+                        <div class="hueco"><span class="emoji">✕</span><b>Pedido cancelado</b><span>No ocupa ninguna plaza de generación.</span></div>
                     <?php elseif ($t['estado'] === 'rechazado'): ?>
                         <div class="hueco rechazo"><span class="emoji">🚫</span><b>Google no lo generó</b>
-                            <?= $h($t['mensaje'] !== '' ? $t['mensaje'] : 'Flow no quiso generarlo.') ?>
+                            <?= $h($frMensajePedido !== '' ? $frMensajePedido : 'Flow no quiso generarlo.') ?>
                             <span class="mini">Cambia el prompt (evita personas famosas, marcas o contenido sensible) y vuelve a pedirlo, o pulsa "Reintentar".</span></div>
                     <?php elseif ($t['estado'] === 'error'): ?>
-                        <div class="hueco error"><span class="emoji">⚠️</span><?= $h($t['mensaje'] !== '' ? $t['mensaje'] : 'Falló sin motivo conocido.') ?><br>Puedes pulsar "Reintentar".</div>
+                        <div class="hueco error"><span class="emoji">⚠️</span><?= $h($frMensajePedido !== '' ? $frMensajePedido : 'Falló sin motivo conocido.') ?><br>Puedes pulsar "Reintentar".</div>
                     <?php else: ?>
-                        <div class="hueco">Terminó sin archivos. <?= $h($t['mensaje']) ?></div>
+                        <div class="hueco">Terminó sin archivos. <?= $h($frMensajePedido) ?></div>
                     <?php endif; ?>
 
-                    <div class="meta">
-                        <?= $h($t['formato'] !== '' ? $t['formato'] : '16:9') ?> · <?= $h($etiquetaModelo($t)) ?>
-                        <?= $t['tipo'] === 'video' ? ' · ' . (int) $t['segundos'] . ' s · ' . (($t['calidad'] ?? '') === '1080p' ? '1080p' : '720p') : '' ?>
-                        <?php if (count($archivos) > 1): ?> · <?= count($archivos) ?> archivos<?php endif; ?>
-                        <?php $proyNuevo = $t['proyecto'] === 'nuevo' || FlowCola::esProyectoPanel($t['proyecto']); ?>
-                        <br>📁 <?= $t['proyecto'] === '' ? 'Proyecto automático' : ($proyNuevo ? $h($t['proyecto_nombre']) : $h($t['proyecto_nombre'] !== '' ? $t['proyecto_nombre'] : 'Proyecto ' . substr($t['proyecto'], 0, 8))) ?>
-                        <br>Pedido el <?= $h(date('d/m/Y H:i', strtotime($t['creado_en']))) ?>
-                        <?php if ($t['estado'] === 'hecho' && $t['terminado_en']):
-                            // Tiempo EXACTO de todo el proceso: desde que se pidió hasta que se entregó.
-                            $segProc = max(1, strtotime($t['terminado_en']) - strtotime($t['creado_en']));
-                            $mm = intdiv($segProc, 60); $ss = $segProc % 60;
-                            $txtProc = $mm > 0 ? ($mm . ' min ' . $ss . ' s') : ($ss . ' s'); ?>
-                            <br>⏱️ <strong>Entregado en <?= $h($txtProc) ?></strong> <span class="mini">(<?= (int) $segProc ?> s exactos, desde que se pidió)</span>
-                        <?php endif; ?>
-                        <?php if ($esAdmin && $t['estado'] === 'hecho' && $t['terminado_en']):
-                            $segTotal = strtotime($t['terminado_en']) - strtotime($t['creado_en']);
-                            $segGen   = $t['tomado_en'] ? strtotime($t['terminado_en']) - strtotime($t['tomado_en']) : $segTotal; ?>
-                            <br><span class="mini" style="color:var(--morado);font-weight:700" title="Cronómetro exacto (solo admin): total desde que se pidió · generación en Google">⏱️ <?= (int) $segTotal ?>s total · <?= (int) $segGen ?>s generando</span>
-                        <?php endif; ?>
-                        <?php if ($esAdmin && !empty($t['cuenta'])): ?><br><span class="mini" title="Cuenta donde se generó">⚙️ Cuenta: <?= $h($t['cuenta']) ?></span><?php endif; ?>
-                        <?php if ($principal && empty($principal['ruta']) && !empty($principal['caduca'])): ?><br>⚠️ Guardado solo como enlace de Flow: descárgalo pronto.<?php endif; ?>
+                    <?php if($principal && $seguimientoPedido['porcentajeTexto']): ?><div class="mini" style="order:-1;color:var(--verde);font-weight:700"><?= $h($seguimientoPedido['porcentajeTexto']) ?><?= $t['estado']==='hecho'?' · Listo':' · Generando' ?></div><?php endif; ?>
+                    <?php $frTiempoPedido=FlowEstado::tiempoEntrega($t,$frSeguimiento['db_ahora']??0); if($frTiempoPedido): ?>
+                    <div class="mini fr-tiempo-entrega" data-fr-tiempo-seg="<?= (int)$frTiempoPedido['segundos'] ?>" data-fr-tiempo-activo="<?= $frTiempoPedido['activo']?'1':'0' ?>" title="Desde que enviaste el pedido hasta que SnaveCloud recibe los resultados">
+                        <?= $h($frTiempoPedido['etiqueta']) ?>: <b data-fr-tiempo-valor><?= $h($frTiempoPedido['texto']) ?></b>
                     </div>
-
+                    <?php endif; ?>
+                    <?php if($seguimientoPedido['politica']): ?>
+                    <div class="aviso err" role="alert" style="margin:4px 0;color:#fecaca;background:#34151b;border:1px solid #ef4444;padding:12px;border-radius:12px">
+                        <b>Rechazo por políticas de Flow</b><br>
+                        <?= $h($seguimientoPedido['politica']) ?><br>
+                        <span class="mini" style="color:inherit">Flow rechazó uno o más resultados por sus políticas de contenido. Modifica el prompt antes de volver a solicitarlo.</span>
+                    </div>
+                    <?php endif; ?>
+                    <?php if($frVerCuenta && $seguimientoPedido['cuenta']): ?>
+                    <div class="mini" style="padding:8px 12px;border:1px solid var(--borde);border-radius:10px;margin:8px 0">
+                        <?= in_array($t['estado'],['procesando','hecho'],true)?'Cuenta de generación:':'Última cuenta:' ?> <b><?= $h($seguimientoPedido['cuenta']) ?></b>
+                        <?php if($seguimientoPedido['perfil']): ?><span> · Motor SnaveCloud #<?= (int)$seguimientoPedido['perfil'] ?> · <?= $seguimientoPedido['enLinea']?'En línea':'Sin conexión reciente' ?></span><?php endif; ?>
+                        <?php if($seguimientoPedido['proyectoUrl']): ?><a href="<?= $h($seguimientoPedido['proyectoUrl']) ?>" target="_blank" rel="noopener">Abrir proyecto en Flow</a><?php endif; ?>
+                    </div>
+                    <?php elseif($frVerCuenta && in_array($t['estado'],['pendiente','procesando'],true)): ?><p class="mini">Cuenta de generación: todavía sin identificar.</p><?php endif; ?>
                     <div class="acciones">
+                        <?php if ($principal && ($principal['tipo'] ?? '') === 'video'): ?>
+                            <a href="<?= $h($src($principal)) ?>" target="_blank" rel="noopener">🔗 Abrir video</a>
+                        <?php endif; ?>
+                        <?php if (FlowCola::sePuedeCancelar($t)): ?>
+                            <form method="post" style="display:inline">
+                                <input type="hidden" name="csrf" value="<?= $csrf ?>">
+                                <input type="hidden" name="accion" value="cancelar">
+                                <input type="hidden" name="id" value="<?= (int) $t['id'] ?>">
+                                <input type="hidden" name="ver" value="<?= $h(in_array($t['proyecto'], ['', 'nuevo'], true) ? '' : $t['proyecto']) ?>">
+                                <button type="submit">✕ Cancelar</button>
+                            </form>
+                        <?php endif; ?>
                         <?php if ($principal && ($principal['tipo'] ?? '') === 'imagen'): $refUsar = !empty($principal['ruta']) ? $principal['ruta'] : $principal['url']; // el video ya tiene "Descargar" en el menú del reproductor ?>
                             <a href="<?= $h($src($principal)) ?>" download>⬇ Descargar</a>
                             <button type="button" class="usar-video" data-usarvideo="<?= $h($refUsar) ?>">🎬 Usar para video</button>
                         <?php endif; ?>
-                        <?php if (in_array($t['estado'], ['error', 'procesando', 'rechazado'], true)): ?>
+                        <?php if (FlowCola::sePuedeReintentar($t)): ?>
                             <form method="post" style="display:inline">
                                 <input type="hidden" name="csrf" value="<?= $csrf ?>">
                                 <input type="hidden" name="accion" value="reintentar">
@@ -1602,11 +1758,13 @@ $user_id = $frUid;
             <input type="hidden" name="accion" value="crear">
             <input type="hidden" name="tipo" id="frTipo" value="<?= $h($ult['tipo']) ?>">
             <input type="hidden" name="modo_prompts" id="frModoPrompts" value="uno">
-            <input type="hidden" name="cantidad" value="1">
+
             <!-- El proyecto es el que está abierto -->
             <input type="hidden" name="proyecto" id="frProyecto" value="">
             <!-- Imágenes adjuntas con el "+" (JSON: inicio/fin/referencias) -->
             <input type="hidden" name="entradas" id="frEntradas" value="">
+
+            <div class="rec-lista st-adjuntos" id="frRecLista" aria-label="Imágenes adjuntas al pedido" hidden></div>
 
             <textarea name="prompts" id="frPrompts" required maxlength="20000" rows="1"
                 placeholder="¿Qué quieres crear?"></textarea>
@@ -1636,16 +1794,19 @@ $user_id = $frUid;
                 <p class="rec-ayuda">Súbela y elige cómo usarla: <b>Inicio</b> o <b>Fin</b> del video, o <b>Referencia</b> de la imagen. (JPG, PNG, WEBP o GIF, máx. 10 MB.)</p>
                 <label class="rec-subir"><input type="file" id="frRecFile" accept="image/*" hidden><span class="ms">upload</span> Subir imagen</label>
                 <div class="rec-progreso" id="frRecProg" hidden><div class="rec-barra"><i id="frRecBarra"></i></div><span id="frRecProgTxt">Subiendo…</span></div>
-                <div class="rec-lista" id="frRecLista"></div>
                 <div class="rec-pie"><button type="button" class="btn-borde" id="frRecListo">Listo</button></div>
             </div>
 
             <!-- Ajustes: una ventanita encima de la caja -->
             <div class="st-ajustes" id="frAjustes">
-                <div class="titulo"><span class="ms">tune</span> Ajustes</div>
+                <div class="aj-cabecera">
+                    <div class="aj-emblema" aria-hidden="true">✨</div>
+                    <div><div class="aj-titulo">Ajustes de creación</div><p class="aj-subtitulo">Dale forma a tu próxima escena</p></div>
+                    <button type="button" class="aj-cerrar" id="frCerrarAjustes" aria-label="Cerrar ajustes"><span class="ms">close</span></button>
+                </div>
                 <div class="grid">
                     <div>
-                        <label class="l">Modelo<?= $esAdmin ? ' de Google' : '' ?></label>
+                        <label class="l">🧠 Modelo<?= $esAdmin ? ' de Google' : '' ?></label>
                         <select name="modelo" id="frModelo">
                             <?php foreach (FLOW_MODELOS as $tipo => $lista): foreach ($lista as $valor => $m): if (!$esAdmin && !$m['gratis']) continue; ?>
                                 <option value="<?= $h($valor) ?>" data-tipo="<?= $tipo ?>" data-flow="<?= $h($m['flow']) ?>" data-gratis="<?= $m['gratis'] ? 1 : 0 ?>"
@@ -1655,25 +1816,45 @@ $user_id = $frUid;
                         <p class="ayuda" id="frNotaModelo"></p>
                     </div>
                     <div>
-                        <label class="l">Formato</label>
+                        <label class="l">📐 Formato</label>
                         <select name="formato" id="frFormato">
                             <option value="16:9" <?= $ult['formato'] === '16:9' ? 'selected' : '' ?>>16:9 · Horizontal</option>
+                            <option value="4:3" data-solo-imagen="1" <?= $ult['formato'] === '4:3' ? 'selected' : '' ?>>4:3 · Horizontal</option>
+                            <option value="1:1" data-solo-imagen="1" <?= $ult['formato'] === '1:1' ? 'selected' : '' ?>>1:1 · Cuadrado</option>
+                            <option value="3:4" data-solo-imagen="1" <?= $ult['formato'] === '3:4' ? 'selected' : '' ?>>3:4 · Vertical</option>
                             <option value="9:16" <?= $ult['formato'] === '9:16' ? 'selected' : '' ?>>9:16 · Vertical</option>
                         </select>
-                        <p class="ayuda">Horizontal: YouTube · Vertical: TikTok, Reels</p>
+                        <p class="ayuda">El formato se aplica a cada resultado.</p>
+                    </div>
+                    <div id="frModoEntradaZona">
+                        <label class="l">🖼️ Imágenes del video</label>
+                        <select name="modo_entrada" id="frModoEntrada">
+                            <option value="fotogramas" <?= ($ult['modo_entrada'] ?? 'ingredientes') === 'fotogramas' ? 'selected' : '' ?>>Fotogramas · Inicio y Fin</option>
+                            <option value="ingredientes" <?= ($ult['modo_entrada'] ?? 'ingredientes') === 'ingredientes' ? 'selected' : '' ?>>Ingredientes · Referencias</option>
+                        </select>
+                        <p class="ayuda">Fotogramas: una imagen de inicio y otra de fin. Ingredientes: combina las referencias.</p>
+                    </div>
+                    <div>
+                        <label class="l">🎞️ Resultados por pedido</label>
+                        <select name="cantidad" id="frCantidad">
+                            <?php foreach ($frPublico ? [1, 2, 3] : [1, 2, 3, 4] as $cantidad): ?>
+                                <option value="<?= $cantidad ?>" <?= min($frPublico ? 3 : 4, (int) ($ult['cantidad'] ?? 1)) === $cantidad ? 'selected' : '' ?>>x<?= $cantidad ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                        <p class="ayuda">Se aplica a cada prompt.<?= $frPublico ? ' x3 ocupa las tres generaciones permitidas por dispositivo, entre videos e im?genes.' : '' ?></p>
                     </div>
                     <div id="frDuracionZona">
-                        <label class="l">Duración</label>
+                        <label class="l">⏱️ Duración</label>
                         <select name="segundos" id="frSegundos">
-                            <?php foreach ([8] as $s): // Solo 8 s (lo que pidió el admin) ?>
-                                <option value="<?= $s ?>" selected><?= $s ?> segundos</option>
+                            <?php foreach ([4, 6, 8] as $s): ?>
+                                <option value="<?= $s ?>" <?= (int) $ult['segundos'] === $s ? 'selected' : '' ?>><?= $s ?> segundos</option>
                             <?php endforeach; ?>
                         </select>
                         <p class="ayuda" id="frAyudaDuracion">Solo para videos</p>
                     </div>
                     <!-- Calidad del video: las dos que Flow da sin gastar créditos -->
                     <div id="frCalidadZona">
-                        <label class="l">Calidad del video</label>
+                        <label class="l">💎 Calidad del video</label>
                         <select name="calidad" id="frCalidad">
                             <?php foreach (FlowCola::CALIDADES as $valor => $c): ?>
                                 <option value="<?= $valor ?>" data-aprox="<?= $h($c['aprox']) ?>" <?= ($ult['calidad'] ?? '720p') === $valor ? 'selected' : '' ?>><?= $h($c['nombre']) ?></option>
@@ -1682,7 +1863,7 @@ $user_id = $frUid;
                         <p class="ayuda">⏱️ <span id="frCalidadAprox"></span></p>
                     </div>
                 </div>
-                <p class="ayuda" style="margin-top:12px"><span id="frEtqPrompt">Describe la escena</span> · <span id="frContador">0 / 1200</span></p>
+                <p class="ayuda aj-pie"><span aria-hidden="true">✍️</span> <span id="frEtqPrompt">Describe la escena</span> · <span id="frContador">0 / 1200</span></p>
             </div>
         </form>
         <p class="fl-nota solo-proyecto">Se guarda en <b id="frProyectoTxt">tu proyecto</b> · <span id="frAyudaPrompt">Cuanto más detalle (lugar, luz, cámara), mejor sale.</span> Flow puede cometer errores: revisa los resultados.<?php if ($retencionDias > 0): ?><br>⏳ <b>Los videos e imágenes se guardan <?= (int) $retencionDias ?> días</b> — descárgalos antes, luego se borran.<?php endif; ?></p>
@@ -1709,10 +1890,32 @@ $user_id = $frUid;
         const masN = document.getElementById('frMasN');
         if (!masBtn || !panel) return;
         let recursos = [];
+        let rolCarga = null;
+        let subiendo = 0;
 
         function tipoActual() { return tipoInput && tipoInput.value === 'imagen' ? 'imagen' : 'video'; }
 
+        const modoEntrada = document.getElementById('frModoEntrada');
+        function normalizarRolesRepetidos() {
+            const frames = tipoActual() === 'video' && modoEntrada.value === 'fotogramas';
+            if (!frames) { recursos.forEach(function (r) { r.rol = 'referencia'; }); return; }
+            recursos.forEach(function (r, i) {
+                if (r.rol !== 'inicio' && r.rol !== 'fin') {
+                    const otra = recursos.find(function (o) { return o !== r && (o.rol === 'inicio' || o.rol === 'fin'); });
+                    r.rol = otra ? (otra.rol === 'inicio' ? 'fin' : 'inicio') : (i === 0 ? 'inicio' : 'fin');
+                }
+            });
+            if (recursos.length === 2 && recursos[0].rol === recursos[1].rol) recursos[1].rol = recursos[0].rol === 'inicio' ? 'fin' : 'inicio';
+        }
+        modoEntrada.addEventListener('change', function () {
+            if (modoEntrada.value === 'fotogramas' && recursos.length > 2) {
+                modoEntrada.value = 'ingredientes';
+                alert('Fotogramas admite dos imágenes. Retira las adicionales o utiliza Ingredientes.');
+            }
+            pintar();
+        });
         function construir() {
+            normalizarRolesRepetidos();
             const e = {};
             recursos.forEach(function (r) {
                 if (r.rol === 'inicio') e.inicio = r.ruta;
@@ -1722,28 +1925,69 @@ $user_id = $frUid;
             entradasInput.value = Object.keys(e).length ? JSON.stringify(e) : '';
             if (masN) { masN.textContent = recursos.length; masN.hidden = recursos.length === 0; }
             masBtn.classList.toggle('con', recursos.length > 0);
+            lista.hidden = recursos.length === 0 && !(tipoActual() === 'video' && modoEntrada.value === 'fotogramas');
         }
+        window.frPrepararAdjuntos = function () {
+            construir();
+            return {entradas:entradasInput.value,cantidad:recursos.length,subiendo};
+        };
         // Limpiar las imágenes adjuntas tras enviar (lo usa el envío por AJAX)
         window.frLimpiarAdjuntos = function () { recursos = []; construir(); pintar(); };
         // Repintar los roles cuando se cambia Video <-> Imagen (los roles válidos cambian)
-        window.frRepintarRecursos = function () { if (recursos.length) pintar(); };
+        window.frRepintarRecursos = function () { pintar(); };
 
+        function adjuntar(ruta, rol = null) {
+            if (tipoActual() === 'video' && modoEntrada.value === 'fotogramas') {
+                rol = rol || (!recursos.some(r => r.rol === 'inicio') ? 'inicio' : !recursos.some(r => r.rol === 'fin') ? 'fin' : null);
+                if (!rol) { alert('Ya tienes Inicio y Fin. Pulsa el cuadro que quieras cambiar.'); return; }
+                recursos = recursos.filter(r => r.rol !== rol); recursos.push({ruta, rol});
+            } else if (!recursos.some(r => r.ruta === ruta)) recursos.push({ruta, rol:'referencia'});
+            pintar();
+        }
+        function pintarFotogramas() {
+            ['inicio','fin'].forEach(function (rol, indice) {
+                if (indice === 1) {
+                    const cambio = document.createElement('button'); cambio.type = 'button'; cambio.className = 'fr-frame-cambio'; cambio.textContent = '↔'; cambio.title = 'Intercambiar Inicio y Fin'; cambio.setAttribute('aria-label', cambio.title); cambio.disabled = recursos.length === 0;
+                    cambio.addEventListener('click', () => { recursos.forEach(r => { r.rol = r.rol === 'inicio' ? 'fin' : 'inicio'; }); pintar(); }); lista.append(cambio);
+                }
+                const recurso = recursos.find(r => r.rol === rol);
+                const item = document.createElement('div'); item.className = 'fr-frame';
+                const elegir = document.createElement('button'); elegir.type = 'button'; elegir.className = 'fr-frame-elegir'; elegir.setAttribute('aria-label',(recurso ? 'Cambiar ' : 'Añadir ') + (rol === 'inicio' ? 'Inicio' : 'Fin'));
+                if (recurso) { const img = document.createElement('img'); img.src = /^https?:\/\//i.test(recurso.ruta) ? recurso.ruta : FR_MEDIA + recurso.ruta; img.alt = rol === 'inicio' ? 'Fotograma de Inicio' : 'Fotograma de Fin'; elegir.append(img); }
+                const etiqueta = document.createElement('span'); etiqueta.textContent = rol === 'inicio' ? 'Inicio' : 'Fin'; elegir.append(etiqueta);
+                elegir.addEventListener('click', () => { rolCarga = rol; fileInput.click(); }); item.append(elegir);
+                if (recurso) { const quitar = document.createElement('button'); quitar.type = 'button'; quitar.className = 'rec-x'; quitar.textContent = '✕'; quitar.setAttribute('aria-label','Quitar imagen de ' + rol); quitar.addEventListener('click', () => { recursos = recursos.filter(r => r.rol !== rol); pintar(); }); item.append(quitar); }
+                item.addEventListener('dragover', ev => { if (arrastrando || Array.from(ev.dataTransfer.types || []).includes('Files')) { ev.preventDefault(); ev.stopPropagation(); item.classList.add('soltando'); } });
+                item.addEventListener('dragleave', () => item.classList.remove('soltando'));
+                item.addEventListener('drop', ev => {
+                    const file = ev.dataTransfer.files && ev.dataTransfer.files[0]; if (!arrastrando && !file) return;
+                    ev.preventDefault(); ev.stopPropagation(); item.classList.remove('soltando');
+                    if (arrastrando) { adjuntar(arrastrando, rol); arrastrando = null; } else subir(file, rol);
+                    const compositor = document.querySelector('.fr .st-compositor'); if (compositor) compositor.classList.remove('soltando');
+                });
+                lista.append(item);
+            });
+        }
         function pintar() {
+            normalizarRolesRepetidos();
             lista.innerHTML = '';
+            if (tipoActual() === 'video' && modoEntrada.value === 'fotogramas') { pintarFotogramas(); construir(); return; }
             // En Imagen solo tiene sentido "Referencia" (Inicio/Fin son fotogramas de
             // video). En Video: Inicio, Fin o Referencia.
-            const opciones = tipoActual() === 'imagen'
+            const opciones = tipoActual() === 'imagen' || modoEntrada.value === 'ingredientes'
                 ? [['referencia', 'Referencia']]
-                : [['inicio', 'Inicio del video'], ['fin', 'Fin del video'], ['referencia', 'Referencia']];
+                : [['inicio', 'Inicio'], ['fin', 'Fin']];
             recursos.forEach(function (r, i) {
                 // Si el rol ya no encaja con el modo (p. ej. venía "inicio" y pasó a Imagen), se ajusta
                 if (!opciones.some(function (o) { return o[0] === r.rol; })) r.rol = opciones[0][0];
                 const item = document.createElement('div');
                 item.className = 'rec-item';
                 const img = document.createElement('img');
-                img.src = /^https?:\/\//i.test(r.ruta) ? r.ruta : (FR_MEDIA + r.ruta); img.alt = '';
+                img.src = /^https?:\/\//i.test(r.ruta) ? r.ruta : (FR_MEDIA + r.ruta); img.alt = 'Imagen adjunta ' + (i + 1);
+                item.title = img.alt;
                 const sel = document.createElement('select');
                 sel.className = 'rec-rol';
+                sel.setAttribute('aria-label', 'Uso de la imagen ' + (i + 1));
                 sel.disabled = opciones.length === 1; // en Imagen no hay nada que elegir
                 opciones.forEach(function (o) {
                     const op = document.createElement('option');
@@ -1760,7 +2004,7 @@ $user_id = $frUid;
                     pintar();
                 });
                 const x = document.createElement('button');
-                x.type = 'button'; x.className = 'rec-x'; x.textContent = '✕'; x.title = 'Quitar';
+                x.type = 'button'; x.className = 'rec-x'; x.textContent = '✕'; x.title = 'Quitar imagen'; x.setAttribute('aria-label', 'Quitar imagen ' + (i + 1));
                 x.addEventListener('click', function () { recursos.splice(i, 1); pintar(); });
                 item.appendChild(img); item.appendChild(sel); item.appendChild(x);
                 lista.appendChild(item);
@@ -1768,8 +2012,9 @@ $user_id = $frUid;
             construir();
         }
 
-        function subir(file) {
+        function subir(file, rolDestino = null) {
             if (!file) return;
+            if (!rolDestino && tipoActual() === 'video' && modoEntrada.value === 'fotogramas' && recursos.length >= 2) { alert('Fotogramas admite una imagen de Inicio y otra de Fin.'); return; }
             prog.hidden = false; barra.style.width = '0%';
             progTxt.textContent = 'Subiendo ' + file.name + '… 0%';
             const fd = new FormData();
@@ -1788,8 +2033,8 @@ $user_id = $frUid;
                 if (xhr.status >= 200 && xhr.status < 300 && j && j.ruta) {
                     barra.style.width = '100%';
                     setTimeout(function () { prog.hidden = true; }, 400);
-                    recursos.push({ ruta: j.ruta, rol: tipoActual() === 'imagen' ? 'referencia' : 'inicio' });
-                    pintar();
+                    adjuntar(j.ruta, rolDestino);
+                    panel.classList.remove('ver');
                 } else {
                     progTxt.textContent = (j && j.error) || 'No se pudo subir la imagen.';
                     barra.style.width = '0%';
@@ -1800,11 +2045,14 @@ $user_id = $frUid;
                 progTxt.textContent = 'Error de red al subir.';
                 setTimeout(function () { prog.hidden = true; }, 3500);
             });
+            subiendo++;
+            xhr.addEventListener('loadend',function(){subiendo=Math.max(0,subiendo-1);});
             xhr.send(fd);
         }
 
         masBtn.addEventListener('click', function (e) { e.stopPropagation(); panel.classList.toggle('ver'); });
-        fileInput.addEventListener('change', function (e) { const f = e.target.files[0]; subir(f); e.target.value = ''; });
+        fileInput.addEventListener('change', function (e) { const f = e.target.files[0]; const rol = rolCarga; rolCarga = null; subir(f, rol); e.target.value = ''; });
+        fileInput.addEventListener('cancel', function () { rolCarga = null; });
         const listo = document.getElementById('frRecListo');
         if (listo) listo.addEventListener('click', function () { panel.classList.remove('ver'); });
         document.addEventListener('click', function (e) {
@@ -1814,8 +2062,8 @@ $user_id = $frUid;
                 const ref = usar.getAttribute('data-usarvideo');
                 const segVideo = document.querySelector('.fr .seg[data-grupo="tipo"] button[data-valor="video"]');
                 if (segVideo) segVideo.click();
-                if (!recursos.some(function (r) { return r.ruta === ref; })) { recursos.push({ ruta: ref, rol: 'inicio' }); pintar(); }
-                panel.classList.add('ver');
+                adjuntar(ref);
+                panel.classList.remove('ver');
                 return;
             }
             if (panel.classList.contains('ver') && !panel.contains(e.target) && !masBtn.contains(e.target) && e.target !== masBtn) {
@@ -1840,19 +2088,24 @@ $user_id = $frUid;
                 e.preventDefault();
                 compositor.classList.remove('soltando');
                 if (!recursos.some(function (r) { return r.ruta === arrastrando; })) {
-                    recursos.push({ ruta: arrastrando, rol: tipoActual() === 'imagen' ? 'referencia' : 'inicio' });
-                    pintar();
-                    panel.classList.add('ver'); // abre el panel para que vea la imagen adjunta
+                    adjuntar(arrastrando);
+                    panel.classList.remove('ver');
                 }
                 arrastrando = null;
             });
         }
+        pintar();
     })();
     </script>
     </div>
 
+    <?php if ($esAdmin): ?>
     <!-- Conexión con la EXTENSIÓN del navegador: pega aquí el token que la extensión
-         SnaveCloud genera en tu Chrome (botón "Copiar"). Vale para clientes y accesos. -->
+         SnaveCloud genera en tu Chrome (botón "Copiar"). Configuración exclusiva del administrador. -->
+    <?php
+    $tokensConn = $esAdmin ? FlowCola::tokensConectados($conn) : [];
+    $frExtActivada = $esAdmin ? count(array_filter($tokensConn, fn($t) => $t['tipo'] === 'Admin')) > 0 : FlowCola::hayToken($conn, $user_id);
+    ?>
     <div class="conexion" id="conexion-ext">
         <form method="post" class="tarjeta google" autocomplete="off">
             <input type="hidden" name="csrf" value="<?= $csrf ?>">
@@ -1860,40 +2113,77 @@ $user_id = $frUid;
             <div class="cab">
                 <div><h2><span class="ms">extension</span> Conexión con la extensión</h2>
                     <p>Pega el token de la extensión (botón "Copiar"). Puedes pegar <b>VARIOS</b>, uno por cada perfil/navegador: se van <b>sumando</b> (no se reemplazan). Abajo, en "Extensiones conectadas", ves todos.</p></div>
-                <span class="estado-api <?= FlowCola::hayToken($conn, $user_id) ? 'on' : 'off' ?>">
-                    <span class="punto"></span><?= FlowCola::hayToken($conn, $user_id) ? 'Activada' : 'Sin activar' ?>
+                <span class="estado-api <?= $frExtActivada ? 'on' : 'off' ?>">
+                    <span class="punto"></span><?= $frExtActivada ? ($esAdmin ? 'Activada · compartida' : 'Activada') : 'Sin activar' ?>
                 </span>
             </div>
             <div class="cuerpo">
+                <div class="fr-extension-descarga">
+                    <a class="btn-borde" href="flow-extension" style="display:inline-flex;gap:7px;align-items:center"><span class="ms">download</span> Descargar extensión · v2.52.49</a>
+                    <p class="mini">💻 Para otra PC: descarga el ZIP, descomprímelo y, en Chrome → Extensiones → Modo de desarrollador, pulsa “Cargar descomprimida”. En DICloak puedes importar el ZIP.</p>
+                    <p class="mini">Abre la extensión, guarda la URL de este panel y copia su token aquí. Cada perfil conserva su propio token.</p>
+                </div>
                 <label class="l">Token de la extensión (48 caracteres)</label>
                 <input type="text" name="token" placeholder="Pega aquí el token de la extensión" autocomplete="off" spellcheck="false" style="font-family:ui-monospace,Consolas,monospace">
                 <button type="submit" class="btn" style="margin-top:10px;padding:10px 16px;border:0;border-radius:10px;background:#6d28d9;color:#fff;font-weight:700;cursor:pointer;">Guardar token</button>
             </div>
         </form>
 
-        <?php if ($esAdmin): $tokensConn = FlowCola::tokensConectados($conn); ?>
+        <?php if ($esAdmin): ?>
         <!-- Lista de extensiones con token: para ver qué cuentas están conectadas -->
         <div class="tarjeta" style="margin-top:12px">
             <div class="cab">
                 <div><h2><span class="ms">devices</span> Extensiones conectadas</h2>
-                    <p>Cada cuenta con su token y si su extensión está en línea ahora.</p></div>
+                    <p>Conexiones compartidas entre administradores. El correo de Flow se identifica por separado; si no aparece, abre el menú de tu cuenta en Flow o indícalo en la extensión.</p></div>
                 <span class="estado-api on"><span class="punto"></span><?= count(array_filter($tokensConn, fn($t) => $t['conectada'])) ?> en línea</span>
             </div>
             <div class="cuerpo">
+                <form method="post" style="margin:0 0 16px;padding:12px;border:1px solid #ddccff;border-radius:12px">
+                    <input type="hidden" name="csrf" value="<?= $csrf ?>">
+                    <input type="hidden" name="accion" value="ext_rotar">
+                    <label style="display:flex;gap:8px;align-items:center;font-weight:700">
+                        <input type="checkbox" name="ext_rotar" value="1" <?= !empty($config['ext_rotar']) ? 'checked' : '' ?>>
+                        Rotar con las cuentas conectadas
+                    </label>
+                    <p class="mini">Reparte videos e imágenes entre las cuentas disponibles. Si Flow devuelve un error recuperable, el pedido pasa a otra cuenta que no haya fallado en ese pedido. Cada cuenta termina su tanda de tres antes de recibir otra. Cada dispositivo puede tener como máximo tres generaciones pendientes o en curso, entre videos e imágenes.</p>
+                    <button type="submit" class="btn-borde">Guardar rotación</button>
+                </form>
                 <?php if (!$tokensConn): ?>
                     <p class="mini" style="margin:0">Ninguna cuenta tiene token todavía. Pega el token de cada extensión en su cuenta (arriba, o en "Accesos").</p>
                 <?php else: ?>
+                <?php
+                $frTokensActivos = array_values(array_filter($tokensConn, fn($t) => $t['conectada']));
+                $frTokensAnteriores = array_values(array_filter($tokensConn, fn($t) => !$t['conectada']));
+                usort($frTokensAnteriores, fn($a, $b) => ($a['hace'] ?? PHP_INT_MAX) <=> ($b['hace'] ?? PHP_INT_MAX));
+                ?>
+                <?php if (!$frTokensActivos): ?><p class="mini">⚪ No hay extensiones en línea ahora.</p><?php endif; ?>
+                <?php foreach ([$frTokensActivos, $frTokensAnteriores] as $frGrupoIndice => $frGrupoTokens): if (!$frGrupoTokens) continue; ?>
+                <?php if ($frGrupoIndice === 1): ?>
+                <details style="margin-top:14px"><summary style="cursor:pointer;font-weight:600">🗂️ Conexiones anteriores (<?= count($frTokensAnteriores) ?>)</summary>
+                <p class="mini">Perfiles desconectados. Se mostrarán arriba cuando vuelvan a conectarse.</p>
+                <?php endif; ?>
                 <div style="overflow-x:auto">
                 <table style="width:100%; border-collapse:collapse; font-size:.86rem">
                     <thead><tr style="text-align:left; color:var(--suave); font-size:.75rem">
-                        <th style="padding:6px">Cuenta (panel)</th><th>Cuenta de Flow</th><th>Tipo</th><th>Estado</th><th>Versión</th><th>Última señal</th>
+                        <th style="padding:6px">Cuenta (panel)</th><th>Cuenta de Flow</th><th>Tipo</th><th>Token</th><th>Estado</th><th>Versión</th><th>Última señal</th>
                     </tr></thead>
                     <tbody>
-                    <?php foreach ($tokensConn as $t): ?>
+                    <?php foreach ($frGrupoTokens as $t): ?>
                         <tr style="border-top:1px solid var(--borde)">
                             <td style="padding:8px 6px; font-weight:600"><?= $h($t['cuenta']) ?></td>
-                            <td style="font-weight:600; color:var(--morado)"><?= $t['cuentaFlow'] ? $h($t['cuentaFlow']) : '<span class="mini" style="color:var(--suave)">— detectando…</span>' ?></td>
+                            <td style="font-weight:600; color:var(--morado)"><?= $t['cuentaFlow'] ? $h($t['cuentaFlow']) : '<span class="mini" style="color:var(--suave)">Correo no identificado</span>' ?></td>
                             <td class="mini"><?= $h($t['tipo']) ?></td>
+                            <td>
+                                <?php if (!empty($t['token'])): ?>
+                                    <div class="fr-token-fila">
+                                        <input class="fr-token-valor" type="password" readonly value="<?= $h($t['token']) ?>" aria-label="Token de esta extensión" autocomplete="off" spellcheck="false">
+                                        <button type="button" class="btn-borde" data-token-ver aria-pressed="false">Ver</button>
+                                        <button type="button" class="btn-borde" data-token-copiar>Copiar</button>
+                                    </div>
+                                <?php else: ?>
+                                    <span class="mini" title="Se guardó solo la huella. Vuelve a pegarlo desde su extensión.">Vuelve a pegar el token</span>
+                                <?php endif; ?>
+                            </td>
                             <td>
                                 <?php if ($t['conectada']): ?><span class="estado hecho">🟢 <?= $t['activa'] ? 'Procesando' : 'Conectada' ?></span>
                                 <?php elseif ($t['nunca']): ?><span class="estado error">⚪ Nunca se conectó</span>
@@ -1906,13 +2196,64 @@ $user_id = $frUid;
                     </tbody>
                 </table>
                 </div>
+                <?php if ($frGrupoIndice === 1): ?></details><?php endif; ?>
+                <?php endforeach; ?>
                 <?php endif; ?>
             </div>
         </div>
         <?php endif; ?>
     </div>
 
+    <?php endif; ?>
+
     <?php if ($esAdmin): ?>
+<script>
+document.addEventListener("click", async function (ev) {
+    const boton = ev.target.closest("[data-token-ver], [data-token-copiar]");
+    if (!boton) return;
+    const campo = boton.closest(".fr-token-fila").querySelector(".fr-token-valor");
+    if (boton.hasAttribute("data-token-ver")) {
+        const mostrar = campo.type === "password";
+        campo.type = mostrar ? "text" : "password";
+        boton.textContent = mostrar ? "Ocultar" : "Ver";
+        boton.setAttribute("aria-pressed", String(mostrar));
+        return;
+    }
+    try {
+        if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(campo.value);
+        else {
+            const anterior = campo.type; campo.type = "text"; campo.focus(); campo.select();
+            let copiado; try { copiado = document.execCommand("copy"); } finally { campo.type = anterior; boton.focus(); }
+            if (!copiado) throw new Error("No se pudo copiar");
+        }
+        boton.textContent = "Copiado";
+    } catch (e) { boton.textContent = "No se pudo copiar"; }
+    setTimeout(() => { boton.textContent = "Copiar"; }, 1800);
+});
+</script>
+<script>
+(() => {
+    function endpoint(nombre) { const u = new URL(location.href); u.search = ""; u.hash = ""; u.searchParams.set(nombre, "1"); return u; }
+    async function datos(nombre) { const r = await fetch(endpoint(nombre), {cache:"no-store", credentials:"same-origin"}); if (!r.ok) throw new Error("Consulta no disponible"); return r.json(); }
+    function texto(tag, clase, valor) { const n = document.createElement(tag); n.className = clase; n.textContent = valor; return n; }
+    const cuentas = document.getElementById("frCuentasRemotas");
+    if (cuentas) datos("panel_cuentas").then(d => {
+        const lista = Array.isArray(d.cuentas) ? d.cuentas : []; cuentas.replaceChildren();
+        const titulo = texto("div","cc-tit","Cuentas conectadas en Núcleo SNAVE "); titulo.append(texto("span","cc-n",lista.length)); cuentas.append(titulo);
+        if (!lista.length) cuentas.append(texto("div","cc-vacio","No se detectan cuentas. Pulsa Probar la conexión."));
+        lista.forEach(c => { const fila = texto("div","cc-item " + (c.sana ? "ok" : "mal"),""); fila.append(texto("span","cc-punto",""),texto("span","cc-mail",c.email),texto("span","cc-salud",c.sana ? "Lista" : c.salud)); cuentas.append(fila); });
+    }).catch(() => { const aviso = cuentas.querySelector(".cc-vacio"); if (aviso) aviso.textContent = "No se pudieron consultar las cuentas. Puedes probar la conexión."; });
+    const r2 = document.getElementById("frR2UsoRemoto");
+    if (r2 && r2.dataset.activo === "1") datos("panel_r2").then(d => {
+        const u = d.uso; if (!u || !Number.isFinite(Number(u.bytes))) return;
+        const bytes = Number(u.bytes), pct = Math.min(100, Math.max(0, bytes / (10 * 1073741824) * 100));
+        const caja = texto("div","",""); caja.style.cssText = "border:1px solid var(--borde);border-radius:12px;padding:12px;margin-bottom:14px";
+        caja.append(texto("div","mini","Almacenamiento usado: " + (bytes / 1073741824).toFixed(2) + " GB · " + Number(u.objetos || 0) + " archivos"));
+        const barra = texto("div","",""); barra.style.cssText = "height:9px;background:var(--borde);border-radius:999px;overflow:hidden;margin-top:8px";
+        const llena = texto("div","",""); llena.style.cssText = "height:100%;background:var(--morado-vivo)"; llena.style.width = pct + "%"; barra.append(llena); caja.append(barra); r2.replaceChildren(caja);
+    }).catch(() => {});
+})();
+</script>
     <!-- Conexión con Núcleo SNAVE (solo admin): el token y la cuenta de Google Flow
          con los que SnaveCloud genera los pedidos de todos. Los clientes no ven esto. -->
     <div class="conexion" id="conexion">
@@ -1938,10 +2279,10 @@ $user_id = $frUid;
                         <span class="mini">Reparte los pedidos, uno a cada cuenta por turno, entre todas las cuentas de Google Flow conectadas y sanas en Núcleo SNAVE. Si una se queda sin créditos o se desconecta, el pedido salta solo a otra.</span></span>
                 </label>
                 <?php if ($apiEstado['tiene_token']): ?>
-                <div class="cuentas-conectadas">
+                <div class="cuentas-conectadas" id="frCuentasRemotas">
                     <div class="cc-tit">Cuentas conectadas en Núcleo SNAVE <span class="cc-n"><?= count($apiCuentas) ?></span></div>
                     <?php if (!$apiCuentas): ?>
-                        <div class="cc-vacio">No se detectan cuentas (token inválido o sin cuentas conectadas). Pulsa "Probar la conexión".</div>
+                        <div class="cc-vacio">Consultando cuentas…</div>
                     <?php else: foreach ($apiCuentas as $c): ?>
                         <div class="cc-item <?= $c['sana'] ? 'ok' : 'mal' ?>">
                             <span class="cc-punto"></span>
@@ -2037,10 +2378,11 @@ $user_id = $frUid;
                 <label class="chk caja">
                     <input type="checkbox" name="clientes_activo" value="1" <?= $config['clientes_activo'] ? 'checked' : '' ?>>
                     <span><b>Clientes y partners del panel pueden usar Flow desde el dashboard</b><br>
-                        <span class="mini">Generan ilimitado en total, con el máximo "a la vez por dispositivo" de abajo. El acceso por <b>/flow</b> se gobierna con el <b>servicio del catálogo</b> (más abajo).</span></span>
+                        <span class="mini">Generan ilimitado en total, con la capacidad de las cuentas de generación disponibles. El acceso por <b>/flow</b> se gobierna con el <b>servicio del catálogo</b> (más abajo).</span></span>
                 </label>
                 <div class="cfg" style="grid-template-columns:1fr 1fr">
-                    <div><label>Videos a la vez POR CUENTA (1-5)</label><input type="number" name="simultaneos" min="1" max="5" value="<?= (int) $config['simultaneos'] ?>"><span class="mini">Cada cuenta de Google Flow genera como máximo estos a la vez. El total en paralelo = este número × cuentas conectadas (ej. 3 × 3 cuentas = 9). La rotación reparte.</span></div>
+                    <p class="mini">En modo extensión, cada cuenta Ultra trabaja en tandas de tres. Las cuentas atienden dispositivos distintos; cada dispositivo tiene un máximo de tres generaciones entre videos e imágenes. Los siguientes esperan a que termine una tanda.</p>
+                    <div><label>Videos a la vez POR CUENTA (1-5)</label><input type="number" name="simultaneos" min="1" max="5" value="<?= $apiEstado['desactivada'] ? 3 : (int) $config['simultaneos'] ?>" <?= $apiEstado['desactivada'] ? 'readonly' : '' ?>><span class="mini">Cada cuenta de Google Flow genera como máximo estos a la vez. El total en paralelo = este número × cuentas conectadas (ej. 3 × 3 cuentas = 9). La rotación reparte.</span></div>
                     <div><label>Dispositivos por cliente en /flow (0 = ilimitado)</label><input type="number" name="dispositivos_max" min="0" max="20" value="<?= (int) $config['dispositivos_max'] ?>"><span class="mini">Si un cliente entra desde más equipos que esto, se le avisa que su cuenta puede bloquearse (anti-reventa). El admin del panel no tiene límite.</span></div>
                     <div><label>Espera máxima de un video (min)</label><input type="number" name="espera_video_min" min="2" max="30" value="<?= (int) $config['espera_video_min'] ?>"></div>
                     <div><label>Espera máxima de una imagen (min)</label><input type="number" name="espera_imagen_min" min="1" max="15" value="<?= (int) $config['espera_imagen_min'] ?>"></div>
@@ -2059,6 +2401,7 @@ $user_id = $frUid;
                 <span class="vivo"><i></i>en vivo</span>
             </div>
             <div class="cuerpo">
+                <p class="mini">Cada cuenta muestra sus pedidos y pasos reales. Máximo tres generaciones por dispositivo; para ocupar nueve plazas hacen falta pedidos de varios dispositivos.</p>
                 <button type="button" class="fr-abrir-monitor" id="frAbrirMonitor"><span class="ms">travel_explore</span> Examinar proceso</button>
             </div>
         </div>
@@ -2076,6 +2419,7 @@ $user_id = $frUid;
                     <button type="button" class="fr-proc-x" id="frMonitorCerrar" title="Cerrar"><span class="ms">close</span></button>
                 </div>
             </div>
+            <div id="frCuentasProceso" style="padding:14px"></div>
             <div id="frProgreso" class="fr-term-live">Esperando…</div>
             <div class="fr-term-sep"><span class="ms">history</span> Historial del proceso <span class="fr-hist-n" id="frHistN">0</span></div>
             <div id="frHistorial" class="fr-hist"></div>
@@ -2134,7 +2478,7 @@ $user_id = $frUid;
             <div style="overflow-x:auto">
             <table style="width:100%; border-collapse:collapse; font-size:.86rem">
                 <thead><tr style="text-align:left; color:var(--suave); font-size:.75rem">
-                    <th style="padding:6px">Correo</th><th>Nombre</th><th>Estado</th><th>Pedidos</th><th>Último acceso</th><th>Token extensión</th><th></th>
+                    <th style="padding:6px">Correo</th><th>Nombre</th><th>Estado</th><th>Pedidos</th><th>Último acceso</th><th>Conexión de generación</th><th></th>
                 </tr></thead>
                 <tbody>
                 <?php foreach ($accesos as $a): ?>
@@ -2145,15 +2489,8 @@ $user_id = $frUid;
                         <td><?= (int) $a['pedidos'] ?></td>
                         <td class="mini"><?= $a['ultimo_acceso'] ? $h(date('d/m/Y H:i', strtotime($a['ultimo_acceso']))) : 'nunca' ?></td>
                         <td>
-                            <?php $tieneTok = FlowCola::hayToken($conn, FlowCola::uidDeAcceso($a['id'])); ?>
-                            <form method="post" style="display:flex; gap:4px; align-items:center">
-                                <input type="hidden" name="csrf" value="<?= $csrf ?>">
-                                <input type="hidden" name="accion" value="acceso_token">
-                                <input type="hidden" name="acceso_id" value="<?= (int) $a['id'] ?>">
-                                <input type="text" name="token" placeholder="<?= $tieneTok ? 'Pega otro para cambiarlo' : 'Pega el token (48)' ?>" style="width:150px; font-family:monospace; font-size:.72rem; padding:4px 6px; border:1px solid var(--borde); border-radius:6px; background:var(--panel); color:var(--texto)">
-                                <button class="btn-borde" style="padding:5px 8px"><?= $tieneTok ? '💾' : 'Guardar' ?></button>
-                                <?php if ($tieneTok): ?><span class="estado hecho" title="Tiene token">✅</span><?php endif; ?>
-                            </form>
+                            <?php $conexionAdmin = FlowCola::estadoExtensionAdmin($conn); ?>
+                            <a class="estado <?= !empty($conexionAdmin['conectada']) ? 'hecho' : 'pendiente' ?>" href="#conexion-ext" title="Usa la conexión del administrador">🔗 Extensión del administrador</a>
                         </td>
                         <td style="white-space:nowrap; text-align:right">
                             <form method="post" style="display:inline">
@@ -2223,6 +2560,7 @@ $user_id = $frUid;
                 </span>
             </div>
             <div class="cuerpo">
+                <div id="frR2UsoRemoto" data-activo="<?= ($r2Estado && $r2Estado['activo']) ? '1' : '0' ?>">
                 <?php if ($r2Uso):
                     $usado = (int) $r2Uso['bytes']; $limite = 10 * 1073741824; $pct = min(100, $limite > 0 ? round($usado / $limite * 100, 1) : 0);
                 ?>
@@ -2232,6 +2570,7 @@ $user_id = $frUid;
                     <div style="font-size:.76rem; color:var(--suave); margin-top:6px"><?= (int) $r2Uso['objetos'] ?> archivos · <?= $pct ?>% usado · quedan <?= $h($fmtBytes(max(0, $limite - $usado))) ?> del tramo gratis</div>
                 </div>
                 <?php endif; ?>
+                </div>
                 <div class="cfg" style="grid-template-columns:1fr 1fr">
                     <div><label>Account ID</label><input type="text" name="r2_account" value="<?= $h($r2Estado['account'] ?? '') ?>" placeholder="32 caracteres hex" spellcheck="false"></div>
                     <div><label>Bucket</label><input type="text" name="r2_bucket" value="<?= $h($r2Estado['bucket'] ?? '') ?>" placeholder="snave-flow" spellcheck="false"></div>
@@ -2658,7 +2997,58 @@ $user_id = $frUid;
         .fr .fr-modo-btn.rapido { color:#0a7d4f; border-color:#9ae0c0; }
         .fr .fr-modo-btn.rapido:hover { background:#0a9d57; color:#fff; border-color:#0a9d57; }
         .fr .fr-modo-btn.on { background:#6d00eb; color:#fff; border-color:#6d00eb; }
-    </style>
+    /* Controles visuales del cuadro de creación */
+.fr .st-ajustes { --aj-fondo:#231c30; --aj-borde:#423350; --aj-tinta:#eee6fa; width:min(440px,100%); padding:20px; max-height:70vh; overflow-y:auto; background:linear-gradient(145deg,#1d1728,#14101d); border-color:#514064; box-shadow:0 24px 70px #0009; }
+.fr .aj-cabecera { display:flex; gap:12px; align-items:center; padding-bottom:16px; margin-bottom:16px; border-bottom:1px solid var(--aj-borde); }
+.fr .aj-emblema { display:grid; place-items:center; width:40px; height:40px; flex:none; background:#7c3aed26; border:1px solid #9c6bec55; border-radius:13px; font-size:21px; }
+.fr .aj-titulo { color:var(--aj-tinta); font-weight:600; font-size:.95rem; }
+.fr .aj-subtitulo { margin:3px 0 0; color:var(--suave); font-size:.72rem; }
+.fr .aj-cerrar { margin-left:auto; display:grid; place-items:center; width:30px; height:30px; flex:none; border:0; border-radius:9px; background:transparent; color:var(--suave); cursor:pointer; }
+.fr .aj-cerrar:hover { background:var(--aj-fondo); color:var(--aj-tinta); }
+.fr .aj-cerrar .ms { font-size:19px; }
+.fr .st-ajustes .grid { gap:16px 12px; }
+.fr .aj-ancho { grid-column:1 / -1; }
+.fr .st-ajustes label.l { justify-content:flex-start; gap:6px; font-size:.75rem; margin-bottom:8px; }
+.fr .aj-opciones { display:grid; grid-template-columns:repeat(var(--aj-columnas,2),minmax(0,1fr)); gap:5px; padding:5px; border:1px solid var(--aj-borde); background:#0002; border-radius:14px; }
+.fr .aj-opcion { display:flex; flex-direction:column; justify-content:center; align-items:center; gap:6px; min-width:0; min-height:42px; padding:8px 4px; border:1px solid transparent; border-radius:10px; background:transparent; color:var(--suave); font:inherit; font-size:.76rem; font-weight:500; cursor:pointer; transition:background .15s,border-color .15s,color .15s; }
+.fr .aj-opcion:hover { color:var(--aj-tinta); background:var(--aj-fondo); }
+.fr .aj-opcion.activa { background:#7c3aed28; border-color:#a879f0; color:var(--aj-tinta); box-shadow:inset 0 0 0 1px #a879f012; }
+.fr .aj-opcion:focus-visible,.fr .aj-cerrar:focus-visible { outline:2px solid #c4a4f4; outline-offset:3px; }
+.fr .aj-opcion:disabled { opacity:.4; cursor:default; }
+.fr .aj-forma { display:block; box-sizing:border-box; height:15px; width:calc(15px * var(--aj-ratio)); max-width:28px; border:2px solid currentColor; border-radius:3px; }
+.fr .aj-emoji { font-size:18px; line-height:1; }
+.fr .st-ajustes select { border:1px solid var(--aj-borde); background-color:var(--aj-fondo); min-height:42px; }
+.fr .st-ajustes .ayuda { line-height:1.5; font-size:.68rem; }
+.fr .st-ajustes .aj-pie { margin-top:16px; border-top:1px solid var(--aj-borde); padding-top:12px; display:flex; gap:6px; align-items:center; }
+.fr.studio:not(.publico) .st-ajustes { --aj-fondo:#f4f1fa; --aj-borde:#e2daef; --aj-tinta:#322046; background:#fff; }
+.fr.studio:not(.publico) .aj-opciones { background:#f7f5fa; }
+.fr.studio:not(.publico) .aj-opcion.activa { background:#ece2fd; color:#6029a0; }
+@media(max-width:520px) { .fr .st-ajustes { padding:16px; } .fr .aj-opciones { gap:3px; padding:4px; } .fr .aj-opcion { font-size:.72rem; } }
+    /* Miniaturas de las imágenes dentro del compositor, como en Flow. */
+    .fr .st-adjuntos { display:flex; flex-direction:row; flex-wrap:wrap; align-items:center; gap:10px; margin:0 0 10px; padding:5px 4px 0 0; }
+    .fr .st-adjuntos .fr-frame { position:relative; width:62px; height:62px; flex:0 0 62px; }
+    .fr .st-adjuntos .fr-frame-elegir { display:flex; align-items:center; justify-content:center; position:relative; width:100%; height:100%; padding:0; overflow:hidden; border:1px solid var(--borde); border-radius:12px; background:var(--panel2); color:var(--suave); font-size:11px; cursor:pointer; }
+    .fr .st-adjuntos .fr-frame-elegir img { width:100%; height:100%; object-fit:cover; }
+    .fr .st-adjuntos .fr-frame-elegir:has(img) span { position:absolute; bottom:0; left:0; right:0; background:rgba(0,0,0,.65); padding:3px; color:white; }
+    .fr .st-adjuntos .fr-frame-cambio { border:0; background:none; color:var(--texto); font-size:19px; padding:4px; cursor:pointer; }
+    .fr .st-adjuntos .fr-frame-cambio:disabled { opacity:.4; }
+    .fr .st-adjuntos .fr-frame.soltando .fr-frame-elegir { outline:2px solid var(--morado); }
+    .fr .st-adjuntos .fr-frame-elegir:focus-visible { outline:2px solid var(--morado); outline-offset:2px; }
+    .fr .st-adjuntos[hidden] { display:none; }
+    .fr .st-adjuntos .rec-item { position:relative; display:block; width:48px; height:48px; flex:0 0 48px; }
+    .fr .st-adjuntos .rec-item img { display:block; width:48px; height:48px; border-radius:10px; object-fit:cover; border:1px solid rgba(255,255,255,.18); box-sizing:border-box; }
+    .fr .st-adjuntos .rec-rol { position:absolute; bottom:0; left:0; width:100%; height:18px; min-height:0; margin:0; padding:0 1px; border:0; border-radius:0 0 9px 9px; background:rgba(16,16,20,.88); color:#fff; font-size:9px; cursor:pointer; }
+    .fr .st-adjuntos .rec-rol:disabled { display:none; }
+    .fr .st-adjuntos .rec-x { position:absolute; top:-5px; right:-5px; display:grid; place-items:center; width:18px; height:18px; padding:0; border:1px solid rgba(255,255,255,.3); border-radius:50%; background:#25242a; color:#fff; font-size:10px; line-height:1; box-shadow:0 1px 4px rgba(0,0,0,.25); cursor:pointer; }
+    .fr .st-adjuntos .rec-x:hover { background:#a32745; }
+    .fr .st-adjuntos .rec-x:focus-visible, .fr .st-adjuntos .rec-rol:focus-visible { outline:2px solid #ac72ff; outline-offset:2px; }
+    .fr.studio:not(.publico) .st-adjuntos .rec-item img { border-color:rgba(0,0,0,.16); }
+.fr .fr-extension-descarga { padding:12px; margin-bottom:16px; border:1px solid var(--borde); border-radius:12px; }
+.fr .fr-extension-descarga .mini { margin:9px 0 0; }
+.fr .fr-token-fila { display:flex; align-items:center; gap:5px; }
+.fr .conexion .fr-token-valor { width:190px; min-width:190px; font:12px ui-monospace,Consolas,monospace; padding:5px 7px; margin:0; }
+.fr .fr-token-fila .btn-borde { padding:5px 8px; white-space:nowrap; }
+</style>
     <div class="sp" id="frSpace" hidden>
         <div class="sp-top">
             <button type="button" class="sp-btn" id="spVolver"><span class="ms">arrow_back</span><span class="t">Studio</span></button>
@@ -2715,8 +3105,28 @@ $user_id = $frUid;
     // Historial del proceso de TODOS los videos (monitor "Progreso y resultado")
     const FR_HIST0 = <?= json_encode($frHistorial, JSON_UNESCAPED_UNICODE) ?>;
     const FR_HEST = { hecho:{c:'ok',ic:'check_circle',t:'Listo'}, procesando:{c:'gen',ic:'bolt',t:'Generándose'},
-        pendiente:{c:'cola',ic:'schedule',t:'En cola'}, error:{c:'err',ic:'error',t:'Error'}, rechazado:{c:'err',ic:'cancel',t:'Rechazado'} };
+        pendiente:{c:'cola',ic:'schedule',t:'En cola'}, error:{c:'err',ic:'error',t:'Error'}, rechazado:{c:'err',ic:'cancel',t:'Rechazado'}, cancelado:{c:'cola',ic:'cancel',t:'Cancelado'} };
     function frEsc(s){ return String(s==null?'':s).replace(/[&<>"]/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m])); }
+    function pintarCuentasProceso(cuentas) {
+        const host=document.getElementById('frCuentasProceso'); if(!host)return;
+        host.replaceChildren();
+        for(const c of cuentas||[]) {
+            const card=document.createElement('section');card.style.cssText='border:1px solid #665380;border-radius:12px;padding:12px;margin-bottom:12px';
+            const title=document.createElement('strong');title.textContent=c.cuenta+' · '+(c.enLinea?(c.activa?'Activa':'Pausada'):'Sin conexión');card.append(title);
+            const active=c.pedidos.filter(p=>p.estado==='procesando');
+            const info=document.createElement('p');info.textContent=active.length+' pedidos en curso · '+(active.length?c.mensaje:c.espera);card.append(info);
+            for(const p of c.pedidos) {
+                const det=document.createElement('details');det.open=p.estado==='procesando';
+                const sum=document.createElement('summary');sum.textContent='#'+p.id+' · '+p.tipo+' · '+(p.estado==='hecho'?'Listo':p.estado)+' · '+p.prompt;det.append(sum);
+                const imgs=document.createElement('p');imgs.textContent=p.entradas+' imágenes de referencia';det.append(imgs);
+                for(const paso of p.pasos){const line=document.createElement('p');line.textContent=paso.cuando+' · '+paso.t+' · '+paso.d;det.append(line);}
+                if(!p.pasos.length){const line=document.createElement('p');line.textContent=p.mensaje||'Sin pasos registrados por esta versión';det.append(line);}
+                card.append(det);
+            }
+            host.append(card);
+        }
+    }
+    pintarCuentasProceso(<?= json_encode($esAdmin ? FlowCola::monitorExtensiones($conn) : [],JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT) ?>);
     function pintarHistorial(rows){
         const cont = document.getElementById('frHistorial'); if (!cont || !Array.isArray(rows)) return;
         cont.innerHTML = rows.map(r => {
@@ -2856,7 +3266,7 @@ $user_id = $frUid;
 
     // El botón dice exactamente qué va a pasar: "Crear video", "Crear 3 imágenes"...
     function pintarBoton() {
-        const n = Math.max(cuantos(), 1);
+        const n = Math.max(cuantos(), 1) * Number($('#frCantidad').value || 1);
         const cosa = tipo.value === 'imagen' ? (n === 1 ? 'imagen' : 'imágenes') : (n === 1 ? 'video' : 'videos');
         // La flecha redonda, como en Flow: el texto va en el título; se enciende al escribir
         const txt = n === 1 ? `Crear ${cosa}` : `Crear ${n} ${cosa}`;
@@ -2875,6 +3285,10 @@ $user_id = $frUid;
             if (ver && !primero) primero = o;
         });
         if (modelo.selectedOptions[0].disabled) modelo.value = primero.value;
+        [...$('#frFormato').options].forEach((o) => { o.hidden = o.disabled = !!o.dataset.soloImagen && tipo.value !== 'imagen'; });
+        if ($('#frFormato').selectedOptions[0].disabled) $('#frFormato').value = '16:9';
+        $('#frModoEntradaZona').hidden = tipo.value === 'imagen';
+        $('#frModoEntrada').disabled = tipo.value === 'imagen';
         segundos.disabled = tipo.value === 'imagen';
         // Las imágenes no tienen duración: ni se enseña
         $('#frDuracionZona').hidden = tipo.value === 'imagen';
@@ -2890,6 +3304,7 @@ $user_id = $frUid;
     function pintarCalidad() {
         $('#frCalidadAprox').textContent = $('#frCalidad').selectedOptions[0].dataset.aprox;
     }
+    $('#frCantidad').addEventListener('change', pintarBoton);
     $('#frCalidad').addEventListener('change', pintarCalidad);
     pintarCalidad();
 
@@ -2956,9 +3371,9 @@ $user_id = $frUid;
         const ico = document.createElement('span');
         ico.className = 'ms';
         ico.textContent = $('#frFormato').value === '9:16' ? 'crop_portrait' : 'crop_landscape';
-        r.append(ico, ' ' + $('#frFormato').value + (esImg ? '' : ' · ' + segundos.value + 's'));
+        r.append(ico, ' ' + $('#frFormato').value + (esImg ? '' : ' · ' + segundos.value + 's') + ' · x' + $('#frCantidad').value + (esImg ? '' : ' · ' + ($('#frModoEntrada').value === 'fotogramas' ? 'Fotogramas' : 'Ingredientes')));
     }
-    ['#frFormato', '#frSegundos', '#frCalidad', '#frModelo'].forEach((s) => $(s).addEventListener('change', pintarResumen));
+    ['#frFormato', '#frSegundos', '#frCalidad', '#frModelo', '#frCantidad', '#frModoEntrada'].forEach((s) => $(s).addEventListener('change', pintarResumen));
     document.querySelectorAll('.fr .seg[data-grupo="tipo"] button').forEach((b) => b.addEventListener('click', () => setTimeout(pintarResumen)));
     $('#frAjustesBtn').addEventListener('click', () => {
         const ver = !$('#frAjustes').classList.contains('ver');
@@ -3000,6 +3415,8 @@ $user_id = $frUid;
         }
         if (frEnviando) return;
         if (!prompts.value.trim()) { prompts.focus(); return; }
+        const adjuntos = window.frPrepararAdjuntos ? window.frPrepararAdjuntos() : null;
+        if (adjuntos && adjuntos.subiendo) { frToast('Espera a que termine de subir tu imagen.',true); return; }
         frEnviando = true;
         const b = $('#frEnviar');
         if (b) b.disabled = true;
@@ -3007,6 +3424,7 @@ $user_id = $frUid;
         try {
             const fd = new FormData(form);
             fd.set('fr_ajax', '1');
+            if (adjuntos) { fd.set('entradas',adjuntos.entradas); fd.set('imagenes_esperadas',String(adjuntos.cantidad)); }
             const r = await fetch(FR_BASE, { method: 'POST', body: fd, credentials: 'same-origin', cache: 'no-store' });
             let d = {};
             try { d = await r.json(); } catch (e2) { d = {}; }
@@ -3117,9 +3535,11 @@ $user_id = $frUid;
     // imágenes y la flecha "← Proyectos" para volver
     const raizFr = $('.fr');
     const hayProyectos = document.querySelectorAll('.fr .proyecto').length > 0;
+    const frUrlsProyecto = <?= json_encode($frUrlsProyecto,JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT) ?>;
     function verLista() {
         videoUnico = null; frTope = 24;
         proyectoElegido = null;
+        if(Object.keys(frUrlsProyecto).length) history.replaceState(null,'','/flow');
         proyectoDelFormulario('');
         raizFr.classList.add('en-lista');
         raizFr.classList.remove('en-proyecto');
@@ -3129,6 +3549,8 @@ $user_id = $frUid;
         const tarjeta = [...document.querySelectorAll('.fr .proyecto')].find((c) => c.dataset.proyecto === id);
         if (!tarjeta) return verLista();
         proyectoElegido = id;
+        const privada=frUrlsProyecto[id];
+        if(privada) history.replaceState(null,'',privada+(location.hash==='#space'?'#space':''));
         raizFr.classList.remove('en-lista');
         raizFr.classList.add('en-proyecto');
         $('#frTituloResultados').textContent = tarjeta.dataset.nombre;
@@ -3169,6 +3591,8 @@ $user_id = $frUid;
     // Lista "Mis videos" de la barra: clic en una fila abre ese video (en su
     // muestra SOLO ese video (modo "video único") y hace scroll hasta él.
     function irAVideo(id) {
+        const entrada=document.querySelector('#frMisVideos .fl-vid[data-ir="'+id+'"]');
+        if(entrada) elegirProyecto(entrada.dataset.proy);
         videoUnico = String(id);
         $('#frBuscar').value = '';
         raizFr.classList.remove('en-lista');
@@ -3183,6 +3607,8 @@ $user_id = $frUid;
             document.querySelectorAll('#frMisVideos .fl-vid').forEach((x) => x.classList.toggle('activo', x.dataset.ir === String(id)));
         }, 60);
     }
+    const detalleCupo=document.getElementById('frCupoPedidos');
+    if(detalleCupo)detalleCupo.addEventListener('click',ev=>{const b=ev.target.closest('[data-cupo-pedido]');if(b)irAVideo(b.dataset.cupoPedido);});
     const _misVid = document.getElementById('frMisVideos');
     if (_misVid) _misVid.addEventListener('click', (ev) => {
         const b = ev.target.closest('.fl-vid');
@@ -3222,6 +3648,13 @@ $user_id = $frUid;
         // Sin nada todavía: solo "Nuevo proyecto" y el mensaje de bienvenida,
         // sin una sección de resultados vacía debajo.
         raizFr.classList.add('en-lista');
+    }
+    if (<?= $frTodos ? 'true' : 'false' ?>) {
+        proyectoElegido = null; videoUnico = null;
+        raizFr.classList.remove('en-lista'); raizFr.classList.add('en-proyecto');
+        $('#frTituloResultados').textContent = 'Todos los clientes · Todos los pedidos';
+        $('#frRenombrar').hidden = true; $('#frProyectoActivoFlow').hidden = true;
+        proyectoDelFormulario(''); aplicarFiltros();
     }
     contarPestanas();
 
@@ -3300,8 +3733,10 @@ $user_id = $frUid;
         const rejilla = $('.fr .rejilla');
         const escribiendo = prompts.value.trim() || (document.activeElement && document.activeElement.closest('.fr form'));
         if (!rejilla) { if (!escribiendo) location.reload(); return; } // antes estaba vacía
-        const html = await (await fetch(FR_BASE, { cache: 'no-store', credentials: 'same-origin' })).text();
+        const html = await (await fetch(FR_BASE + <?= json_encode($frTodos ? '?admin_todos=1&pagina='.$frPaginaAdmin['pagina'] : '') ?>, { cache: 'no-store', credentials: 'same-origin' })).text();
         const nueva = new DOMParser().parseFromString(html, 'text/html');
+        const mapa=nueva.querySelector('#frMapaProyectos');
+        if(mapa) Object.assign(frUrlsProyecto,JSON.parse(mapa.textContent));
         const ids = [...nueva.querySelectorAll('.fr .rejilla .job')].map((j) => j.dataset.id);
         let anterior = null;
         for (const id of ids) {
@@ -3347,6 +3782,22 @@ $user_id = $frUid;
         // se ve negro hasta darle play). preload=metadata + #t=0.1 pinta ese frame
         // sin bajar el video entero.
         const cargarLazy = (v) => {
+            if(!v.dataset.frReintento){
+                v.dataset.frReintento='1';
+                let intentos=0,reloj=null;
+                const programar=()=>{
+                    if(reloj || intentos>=3 || !v.isConnected || !v.paused || v.readyState>=2)return;
+                    reloj=setTimeout(()=>{
+                        reloj=null;
+                        if(!v.isConnected || !v.paused || v.readyState>=2)return;
+                        intentos++;v.load();programar();
+                    },10000);
+                };
+                v.addEventListener('error',programar);
+                v.addEventListener('stalled',programar);
+                v.addEventListener('loadeddata',()=>{if(reloj)clearTimeout(reloj);reloj=null;});
+                programar();
+            }
             if (v.dataset.src) {
                 v.preload = 'metadata';
                 v.src = /#t=/.test(v.dataset.src) ? v.dataset.src : v.dataset.src + '#t=0.1';
@@ -3376,13 +3827,18 @@ $user_id = $frUid;
         if (enCurso) return;
         enCurso = true;
         try {
-            const r = await (await fetch(FR_BASE + '?vivo=1', { cache: 'no-store', credentials: 'same-origin' })).json();
+            const r = await (await fetch(FR_BASE + '?vivo=1' + <?= json_encode($frTodos ? '&admin_todos=1&pagina='.$frPaginaAdmin['pagina'] : '') ?>, { cache: 'no-store', credentials: 'same-origin' })).json();
+            if(r.cupo && document.getElementById('frCupoTexto')) {
+                document.getElementById('frCupoTexto').textContent=r.cupo.usadas+'/3 generaciones ocupadas · '+r.cupo.libres+' disponibles';
+                const lista=document.getElementById('frCupoPedidos');lista.replaceChildren();
+                for(const p of r.cupo.pedidos){const fila=document.createElement('div');const boton=document.createElement('button');boton.type='button';boton.className='btn-borde';boton.dataset.cupoPedido=p.id;boton.textContent='Ver pedido #'+p.id;fila.append(boton,document.createTextNode(' · '+(p.proyecto_nombre||'Otro proyecto')+' · '+p.cantidad+' plaza(s)'));lista.append(fila);}
+            }
             { const _v = $('#frVivo'); if (_v) _v.classList.remove('caido'); }
             // PANEL "solo números": no hay galería, así que NO se baja toda la página.
             // Solo se actualizan los totales del tablero desde este JSON liviano.
             if (FR_PANEL) {
                 try { pintarTablero(r.totales); } catch (e3) {}
-                try { if (r.historial) pintarHistorial(r.historial); } catch (e4) {}
+                try { if (r.historial) pintarHistorial(r.historial); if(r.extensionesProceso) pintarCuentasProceso(r.extensionesProceso); } catch (e4) {}
             } else
             // LO IMPORTANTE primero: refrescar la galería (nuevos pedidos y cambios de estado).
             if (firmas) {
@@ -3399,7 +3855,7 @@ $user_id = $frUid;
                     // el refresco hasta que el medio aparezca.
                     if (est === 'hecho' || est === 'error' || est === 'rechazado') {
                         const card = rejillaViva && rejillaViva.querySelector('.job[data-id="' + id + '"]');
-                        if (card && card.querySelector('.hueco') && !card.querySelector('img, video')) cambiadas.add(id);
+                        if (card && card.querySelector('.hueco') && !card.querySelector(':scope > a img, :scope > video')) cambiadas.add(id);
                     }
                 }
                 const hayBorradas = Object.keys(firmas).some((id) => !(id in r.firmas));
@@ -3421,8 +3877,22 @@ $user_id = $frUid;
             enCurso = false;
         }
     }
+    // Duracion basada en el reloj del servidor; no depende de la hora del cliente.
+    const frTiemposInicio=new WeakMap();
+    function pintarTiemposEntrega(){
+        const ahora=performance.now();
+        document.querySelectorAll('[data-fr-tiempo-activo="1"]').forEach(el=>{
+            if(!frTiemposInicio.has(el))frTiemposInicio.set(el,ahora);
+            const s=Math.max(0,Number(el.dataset.frTiempoSeg)||0)+Math.floor((ahora-frTiemposInicio.get(el))/1000);
+            const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);
+            const valor=el.querySelector('[data-fr-tiempo-valor]');
+            if(valor)valor.textContent=(h?h+' h ':'')+(m||h?m+' min ':'')+(s%60)+' s';
+        });
+    }
+    pintarTiemposEntrega();
+    setInterval(pintarTiemposEntrega,1000);
     latido();
-    setInterval(latido, 4000);
+    setInterval(latido, 2000);
     // Con la pestaña en segundo plano Chrome frena los relojes (una vez por
     // minuto): al volver a ella se mira al instante, sin esperar
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') latido(); });
@@ -4166,4 +4636,92 @@ $user_id = $frUid;
 })();
 </script>
 
+<script>
+(function () {
+    const panel = document.getElementById('frAjustes');
+    if (!panel) return;
+    document.getElementById('frCerrarAjustes').addEventListener('click', function () {
+        panel.classList.remove('ver');
+        const boton = document.getElementById('frAjustesBtn'); boton.setAttribute('aria-expanded', 'false'); boton.focus();
+    });
+    ['frModelo', 'frFormato', 'frModoEntrada', 'frCalidad'].forEach(function (id) { document.getElementById(id).parentElement.classList.add('aj-ancho'); });
+    ['frFormato', 'frModoEntrada', 'frSegundos', 'frCantidad'].forEach(function (id) {
+        const select = document.getElementById(id);
+        const grupo = document.createElement("div"); grupo.className = "aj-opciones";
+        grupo.setAttribute("role", "group");
+        const label = select.parentElement.querySelector("label");
+        label.id = id + "Etiqueta"; grupo.setAttribute("aria-labelledby", label.id);
+        select.after(grupo);
+        let firma = "";
+        function pintar() {
+            const opciones = [...select.options].filter(function (o) { return !o.hidden && !o.disabled; });
+            const nueva = opciones.map(function (o) { return o.value; }).join("|");
+            if (nueva !== firma) {
+                firma = nueva; grupo.replaceChildren(); grupo.style.setProperty("--aj-columnas", opciones.length);
+                opciones.forEach(function (opcion) {
+                    const boton = document.createElement("button"); boton.type = "button"; boton.className = "aj-opcion"; boton.dataset.valor = opcion.value;
+                    boton.setAttribute("aria-label", opcion.textContent.trim()); boton.title = opcion.textContent.trim();
+                    if (id === "frFormato") {
+                        const forma = document.createElement("span"); forma.className = "aj-forma"; forma.setAttribute("aria-hidden", "true");
+                        const partes = opcion.value.split(":").map(Number); forma.style.setProperty("--aj-ratio", partes[0] / partes[1]); boton.append(forma);
+                    }
+                    if (id === "frModoEntrada") {
+                        const emoji = document.createElement("span"); emoji.className = "aj-emoji"; emoji.setAttribute("aria-hidden", "true");
+                        emoji.textContent = opcion.value === "fotogramas" ? "🎬" : "🧩"; boton.append(emoji);
+                    }
+                    const texto = document.createElement("span");
+                    texto.textContent = id === "frFormato" ? opcion.value : id === "frSegundos" ? opcion.value + " s" : id === "frModoEntrada" ? (opcion.value === "fotogramas" ? "Fotogramas" : "Ingredientes") : opcion.textContent.trim();
+                    boton.append(texto);
+                    boton.addEventListener("click", function () { select.value = opcion.value; select.dispatchEvent(new Event("change", {bubbles:true})); pintar(); });
+                    grupo.append(boton);
+                });
+            }
+            [...grupo.children].forEach(function (boton) {
+                const activa = boton.dataset.valor === select.value; boton.classList.toggle("activa", activa);
+                boton.setAttribute("aria-pressed", String(activa)); boton.disabled = select.disabled;
+            });
+        }
+        select.addEventListener("change", pintar);
+        new MutationObserver(pintar).observe(select, {subtree:true, childList:true, attributes:true, attributeFilter:["hidden","disabled","selected"]});
+        pintar(); select.hidden = true;
+    });
+})();
+</script>
+<style>
+#frVisorImagen { box-sizing:border-box; width:min(1000px,94vw); max-width:94vw; max-height:92vh; padding:42px 12px 12px; border:1px solid #443653; border-radius:16px; background:#100c17; color:#fff; overflow:auto; }
+#frVisorImagen::backdrop { background:rgba(0,0,0,.8); }
+#frVisorImagenFoto { display:block; width:auto; height:auto; max-width:100%; max-height:calc(92vh - 70px); object-fit:contain; margin:auto; }
+#frVisorImagenCerrar { position:absolute; right:10px; top:8px; width:30px; height:30px; padding:0; border:1px solid #655576; border-radius:50%; background:#261d32; color:#fff; font:600 16px sans-serif; cursor:pointer; }
+#frVisorImagenCerrar:focus-visible { outline:2px solid #c4a0ff; outline-offset:2px; }
+</style>
+<dialog id="frVisorImagen" aria-label="Vista de imagen">
+    <button id="frVisorImagenCerrar" type="button" aria-label="Cerrar imagen">X</button>
+    <img id="frVisorImagenFoto" alt="">
+</dialog>
+<script>
+(function () {
+    const visor = document.getElementById('frVisorImagen');
+    const imagen = document.getElementById('frVisorImagenFoto');
+    const cerrar = document.getElementById('frVisorImagenCerrar');
+    if (!visor || !imagen || !cerrar) return;
+    let anterior, overflowAnterior;
+    document.addEventListener('click', function (ev) {
+        const enlace = ev.target.closest && ev.target.closest('.fr .job a[data-fr-imagen]');
+        if (!enlace) return;
+        ev.preventDefault();
+        const miniatura = enlace.querySelector('img');
+        anterior = enlace; overflowAnterior = document.body.style.overflow;
+        imagen.src = enlace.href;
+        imagen.alt = miniatura && miniatura.alt || 'Imagen del pedido';
+        document.body.style.overflow = 'hidden';
+        visor.showModal(); cerrar.focus();
+    });
+    cerrar.addEventListener('click', function () { visor.close(); });
+    visor.addEventListener('click', function (ev) { if (ev.target === visor) visor.close(); });
+    visor.addEventListener('close', function () {
+        imagen.removeAttribute('src'); document.body.style.overflow = overflowAnterior || '';
+        if (anterior && anterior.isConnected) anterior.focus();
+    });
+})();
+</script>
 <?php if ($frPublico) { ($frPublico['pie'])(); } else { include __DIR__ . '/app/footer.php'; } ?>

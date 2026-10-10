@@ -1,5 +1,0 @@
-{
-  "_ayuda": "URL del panel que trae la extension por defecto. PRUEBA LOCAL: snavecloud.test. Para produccion, cambia panel_url a https://app.snavecloud.pro/dashboard/ y vuelve a empaquetar.",
-  "panel_url": "http://snavecloud.test/dashboard/",
-  "sync_url": "https://sync.snavecloud.site"
-}
